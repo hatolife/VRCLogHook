@@ -1,0 +1,17 @@
+# Go build/test caches and binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+
+# Local secrets and private test settings
+.local/
+
+# Optional local config overrides
+config.local.json
+config.local.hjson

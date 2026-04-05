@@ -58,6 +58,13 @@ Audit must include:
 - CI/CD must run build/test/lint before release.
 - Tag-based release pattern: `v*`.
 
+## Test-First Rules
+- Development must follow a strict test-first cycle.
+- Start from a small failing test for one behavior.
+- Implement the minimum code to pass the test.
+- Refactor after tests pass while keeping tests green.
+- Repeat in small increments; avoid large untested changes.
+
 ## Git Workflow Rules
 - Do not work directly on `main` except for emergency hotfix coordination.
 - Start each task on a dedicated branch and merge back via PR.
