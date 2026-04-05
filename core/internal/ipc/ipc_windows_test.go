@@ -23,32 +23,21 @@ func TestServerClientMethodsWindows(t *testing.T) {
 	go func() { _ = srv.Start(ctx) }()
 	time.Sleep(120 * time.Millisecond)
 
-	var (
-		resp Response
-		err  error
-	)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err = Call(pipe, Request{Token: "tok", Method: "status"})
-		if err == nil {
-			break
-		}
-		time.Sleep(120 * time.Millisecond)
-	}
+	resp, err := callEventually(pipe, Request{Token: "tok", Method: "status"}, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resp.OK {
 		t.Fatalf("status should be ok: %+v", resp)
 	}
-	resp, err = Call(pipe, Request{Token: "bad", Method: "status"})
+	resp, err = callEventually(pipe, Request{Token: "bad", Method: "status"}, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.OK {
 		t.Fatal("unauthorized request should fail")
 	}
-	resp, err = Call(pipe, Request{Token: "tok", Method: "stop"})
+	resp, err = callEventually(pipe, Request{Token: "tok", Method: "stop"}, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,4 +46,20 @@ func TestServerClientMethodsWindows(t *testing.T) {
 	}
 	cancel()
 	srv.Close()
+}
+
+func callEventually(pipe string, req Request, timeout time.Duration) (Response, error) {
+	deadline := time.Now().Add(timeout)
+	var (
+		resp Response
+		err  error
+	)
+	for time.Now().Before(deadline) {
+		resp, err = Call(pipe, req)
+		if err == nil {
+			return resp, nil
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+	return Response{}, err
 }
