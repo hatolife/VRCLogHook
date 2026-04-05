@@ -168,3 +168,23 @@
   - 負荷が少ないこと
 - 各チェックでは、満たしている根拠と未達リスクを短く記録する（Markdown）
 - 未達がある場合は、修正案を提示してから次工程へ進む
+
+## 17. 現実装ステータス（GUI未実装時点）
+- 実装済み（core）:
+  - ログ監視（追加行追跡、起動時既存行チェック、ローテーション追従）
+  - マッチ判定（contains/regex）
+  - 通知（ローカルJSONL + Discord Webhook）
+  - Hook安全制御（既定無効、明示同意、タイムアウト、並列上限）
+  - 設定生成/読込（JSON/HJSON風）、未知キー拒否、範囲検証
+  - 状態永続化（オフセット保存、破損復旧）
+  - IPC（Windows Named Pipe / macOS・Linux Unix Domain Socket）
+  - 自己ログ（レベル制御、stdoutミラー）
+  - `--dry-run`、`--status`、`--reload`、`--stop`、`--print-config`
+- 実装済み（テスト/運用）:
+  - ユニット/統合テスト群
+  - ローカル専用Webhook統合テスト（`-tags=integration`）
+  - GitHub Actions `ci`/`release` ワークフロー定義
+- 未完了/残作業:
+  - GUI本実装（現状は軽量CLI風クライアント）
+  - 「コマンド起動からGUIを開く手段」の実装
+  - GitHub Actions実行結果の実機確認と微修正
