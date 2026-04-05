@@ -69,10 +69,11 @@ type MatchConfig struct {
 }
 
 type Rule struct {
-	Name          string `json:"name"`
-	Contains      string `json:"contains"`
-	Regex         string `json:"regex"`
-	CaseSensitive bool   `json:"case_sensitive"`
+	Name            string `json:"name"`
+	Contains        string `json:"contains"`
+	Regex           string `json:"regex"`
+	CaseSensitive   bool   `json:"case_sensitive"`
+	MessageTemplate string `json:"message_template"`
 }
 
 type HookConfig struct {
@@ -154,7 +155,24 @@ func Defaults() Config {
 		Match: MatchConfig{
 			DedupeWindowSec: 30,
 			Rules: []Rule{
-				{Name: "example-error", Contains: "Exception", CaseSensitive: false},
+				{
+					Name:            "player-joined",
+					Regex:           `(?i)OnPlayer(Joined|EnteredRoom)\b`,
+					CaseSensitive:   false,
+					MessageTemplate: "[join] {line}",
+				},
+				{
+					Name:            "player-left",
+					Regex:           `(?i)OnPlayerLeft(Room)?\b`,
+					CaseSensitive:   false,
+					MessageTemplate: "[left] {line}",
+				},
+				{
+					Name:            "runtime-exception",
+					Contains:        "Exception",
+					CaseSensitive:   false,
+					MessageTemplate: "[error] {line}",
+				},
 			},
 		},
 		Hooks: HookConfig{
@@ -210,6 +228,10 @@ func Load(path string) (Config, error) {
 	if cfg.Version == "" {
 		cfg.Version = "1"
 	}
+	if runtime.GOOS == "windows" {
+		cfg.Monitor.LogDir = normalizeLegacyWindowsLogDir(cfg.Monitor.LogDir)
+	}
+	upgradeLegacyMatchRules(&cfg)
 	if strings.TrimSpace(cfg.Observability.LogLevel) == "" {
 		cfg.Observability.LogLevel = "info"
 	}
@@ -217,6 +239,41 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func upgradeLegacyMatchRules(cfg *Config) {
+	for i := range cfg.Match.Rules {
+		r := &cfg.Match.Rules[i]
+		if r.Regex != "" {
+			continue
+		}
+		if r.Name == "player-joined" && strings.EqualFold(strings.TrimSpace(r.Contains), "OnPlayerJoined") {
+			r.Contains = ""
+			r.Regex = `(?i)OnPlayer(Joined|EnteredRoom)\b`
+			r.CaseSensitive = false
+		}
+		if r.Name == "player-left" && strings.EqualFold(strings.TrimSpace(r.Contains), "OnPlayerLeft") {
+			r.Contains = ""
+			r.Regex = `(?i)OnPlayerLeft(Room)?\b`
+			r.CaseSensitive = false
+		}
+		if strings.TrimSpace(r.MessageTemplate) == "" {
+			r.MessageTemplate = defaultRuleTemplate(r.Name)
+		}
+	}
+}
+
+func defaultRuleTemplate(name string) string {
+	switch name {
+	case "player-joined":
+		return "[join] {line}"
+	case "player-left":
+		return "[left] {line}"
+	case "runtime-exception":
+		return "[error] {line}"
+	default:
+		return "[{rule}] {line}"
+	}
 }
 
 func Save(path string, cfg Config) error {
@@ -403,7 +460,7 @@ func defaultVRChatLogDir(home string) string {
 	case "windows":
 		localApp := os.Getenv("LOCALAPPDATA")
 		if localApp != "" {
-			return filepath.Join(localApp, "Low", "VRChat", "VRChat")
+			return filepath.Join(filepath.Dir(localApp), "LocalLow", "VRChat", "VRChat")
 		}
 		return filepath.Join(home, "AppData", "LocalLow", "VRChat", "VRChat")
 	case "darwin":
@@ -411,4 +468,18 @@ func defaultVRChatLogDir(home string) string {
 	default:
 		return filepath.Join(home, ".config", "unity3d", "VRChat", "VRChat")
 	}
+}
+
+func normalizeLegacyWindowsLogDir(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return p
+	}
+	p = strings.NewReplacer("/", `\`).Replace(p)
+	lower := strings.ToLower(p)
+	needle := `\appdata\local\low\vrchat\vrchat`
+	if i := strings.Index(lower, needle); i >= 0 {
+		return p[:i] + `\AppData\LocalLow\VRChat\VRChat`
+	}
+	return p
 }

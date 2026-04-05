@@ -55,6 +55,35 @@ func TestDefaultsValidate(t *testing.T) {
 	}
 }
 
+func TestDefaultsIncludeVRChatJoinLeavePatterns(t *testing.T) {
+	cfg := Defaults()
+	rules := cfg.Match.Rules
+	if rules[0].MessageTemplate == "" || rules[1].MessageTemplate == "" {
+		t.Fatal("default message_template should not be empty")
+	}
+	compiled, err := regexp.Compile(rules[0].Regex)
+	if err != nil {
+		t.Fatalf("join rule regex should compile: %v", err)
+	}
+	if !compiled.MatchString("2026.04.05 23:12:10 Debug      -  [Behaviour] OnPlayerEnteredRoom") {
+		t.Fatal("join rule should match OnPlayerEnteredRoom")
+	}
+	if !compiled.MatchString("2026.04.05 23:12:10 Debug      -  [Behaviour] OnPlayerJoined") {
+		t.Fatal("join rule should match OnPlayerJoined")
+	}
+
+	leftCompiled, err := regexp.Compile(rules[1].Regex)
+	if err != nil {
+		t.Fatalf("left rule regex should compile: %v", err)
+	}
+	if !leftCompiled.MatchString("2026.04.05 23:12:20 Debug      -  [Behaviour] OnPlayerLeftRoom") {
+		t.Fatal("left rule should match OnPlayerLeftRoom")
+	}
+	if !leftCompiled.MatchString("2026.04.05 23:12:20 Debug      -  [Behaviour] OnPlayerLeft Alice (usr_xxx)") {
+		t.Fatal("left rule should match OnPlayerLeft")
+	}
+}
+
 func TestLoadRejectsUnknownKey(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.json")
@@ -149,5 +178,62 @@ func TestMaskedToken(t *testing.T) {
 	}
 	if MaskedToken("") != "" {
 		t.Fatal("empty token should stay empty")
+	}
+}
+
+func TestLoadUpgradesLegacyJoinLeaveRules(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	raw := `{
+  "version": "1",
+  "token": "tok-test",
+  "monitor": {"poll_interval_sec": 10, "log_dir": "/tmp", "file_glob": "output_log_*.txt", "check_existing_on_first_run": true},
+  "state": {"path": "/tmp/state.json", "save_interval_sec": 10},
+  "notify": {
+    "discord": {"enabled": false, "webhook_url": "", "username": "x", "max_content_rune": 1000},
+    "local": {"path": "/tmp/events.log"},
+    "retry": {"max_attempts": 2, "initial_backoff_ms": 100, "max_backoff_ms": 500}
+  },
+  "match": {
+    "rules": [
+      {"name":"player-joined","contains":"OnPlayerJoined","regex":"","case_sensitive":false},
+      {"name":"player-left","contains":"OnPlayerLeft","regex":"","case_sensitive":false}
+    ],
+    "dedupe_window_sec": 30
+  },
+  "hooks": {"enabled": false, "unsafe_consent": false, "max_concurrency": 1, "timeout_sec": 5, "commands": []},
+  "runtime": {"dry_run": false, "hot_reload": true, "config_reload_sec": 2},
+  "observability": {"self_log_path": "/tmp/self.log", "status_log_sec": 10, "log_level": "info", "stdout": true}
+}`
+	if err := os.WriteFile(p, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Match.Rules[0].Regex == "" || cfg.Match.Rules[0].Contains != "" {
+		t.Fatalf("join rule was not upgraded: %+v", cfg.Match.Rules[0])
+	}
+	if cfg.Match.Rules[1].Regex == "" || cfg.Match.Rules[1].Contains != "" {
+		t.Fatalf("left rule was not upgraded: %+v", cfg.Match.Rules[1])
+	}
+	if cfg.Match.Rules[0].MessageTemplate == "" || cfg.Match.Rules[1].MessageTemplate == "" {
+		t.Fatal("legacy rules should receive default message_template")
+	}
+}
+
+func TestNormalizeLegacyWindowsLogDir(t *testing.T) {
+	in := `C:\Users\user\AppData\Local\Low\VRChat\VRChat`
+	got := normalizeLegacyWindowsLogDir(in)
+	want := `C:\Users\user\AppData\LocalLow\VRChat\VRChat`
+	if got != want {
+		t.Fatalf("unexpected normalized path: got=%q want=%q", got, want)
+	}
+
+	in2 := `C:/Users/user/AppData/Local/Low/VRChat/VRChat`
+	got2 := normalizeLegacyWindowsLogDir(in2)
+	if got2 != want {
+		t.Fatalf("slash normalized path mismatch: got=%q want=%q", got2, want)
 	}
 }

@@ -1,22 +1,27 @@
 package notify
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/hatolife/VRCLogHook/core/internal/config"
 	"github.com/hatolife/VRCLogHook/core/internal/monitor"
 )
 
+var ErrCurlNotFound = errors.New("curl command was not found")
+
 type Dispatcher struct {
-	httpClient *http.Client
+	lookPath func(string) (string, error)
+	runCurl  func(context.Context, []string) (string, error)
+	curlCmd  string
 }
 
 type Payload struct {
@@ -28,10 +33,24 @@ type Payload struct {
 }
 
 func New() *Dispatcher {
-	return &Dispatcher{httpClient: &http.Client{Timeout: 10 * time.Second}}
+	cmd := curlCommandName()
+	return &Dispatcher{
+		lookPath: exec.LookPath,
+		runCurl: func(ctx context.Context, args []string) (string, error) {
+			c := exec.CommandContext(ctx, cmd, args...)
+			b, err := c.CombinedOutput()
+			return string(b), err
+		},
+		curlCmd: cmd,
+	}
 }
 
 func (d *Dispatcher) Send(ctx context.Context, cfg config.Config, ruleName string, ev monitor.Event) error {
+	return d.SendWithRule(ctx, cfg, config.Rule{Name: ruleName}, ev)
+}
+
+func (d *Dispatcher) SendWithRule(ctx context.Context, cfg config.Config, rule config.Rule, ev monitor.Event) error {
+	ruleName := rule.Name
 	p := Payload{
 		Rule:   ruleName,
 		File:   ev.File,
@@ -48,8 +67,11 @@ func (d *Dispatcher) Send(ctx context.Context, cfg config.Config, ruleName strin
 	if cfg.Notify.Discord.WebhookURL == "" {
 		return errors.New("discord webhook is empty")
 	}
+	if _, err := d.lookPath(d.curlCmd); err != nil {
+		return fmt.Errorf("%w. %s", ErrCurlNotFound, curlInstallGuide())
+	}
 
-	msg := fmt.Sprintf("[%s] %s", ruleName, ev.Line)
+	msg := renderMessage(rule, ev)
 	runes := []rune(msg)
 	if len(runes) > cfg.Notify.Discord.MaxContentRune {
 		msg = string(runes[:cfg.Notify.Discord.MaxContentRune])
@@ -68,18 +90,23 @@ func (d *Dispatcher) Send(ctx context.Context, cfg config.Config, ruleName strin
 	var lastErr error
 
 	for i := 0; i < attempts; i++ {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Notify.Discord.WebhookURL, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := d.httpClient.Do(req)
-		if err == nil && resp != nil {
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return nil
-			}
-			err = fmt.Errorf("discord response status: %d", resp.StatusCode)
+		args := []string{
+			"-sS", "-f",
+			"-X", "POST", cfg.Notify.Discord.WebhookURL,
+			"-H", "Content-Type: application/json",
+			"-d", string(body),
+			"--max-time", "10",
 		}
-		lastErr = err
+		out, err := d.runCurl(ctx, args)
+		if err == nil {
+			return nil
+		}
+		msg := strings.TrimSpace(out)
+		if msg == "" {
+			lastErr = fmt.Errorf("curl failed: %w", err)
+		} else {
+			lastErr = fmt.Errorf("curl failed: %w: %s", err, msg)
+		}
 
 		if i < attempts-1 {
 			select {
@@ -94,6 +121,20 @@ func (d *Dispatcher) Send(ctx context.Context, cfg config.Config, ruleName strin
 		}
 	}
 	return lastErr
+}
+
+func renderMessage(rule config.Rule, ev monitor.Event) string {
+	tmpl := strings.TrimSpace(rule.MessageTemplate)
+	if tmpl == "" {
+		tmpl = "[{rule}] {line}"
+	}
+	repl := strings.NewReplacer(
+		"{rule}", rule.Name,
+		"{line}", ev.Line,
+		"{file}", ev.File,
+		"{at}", ev.At.Format(time.RFC3339),
+	)
+	return repl.Replace(tmpl)
 }
 
 func appendLocal(path string, p Payload) error {
@@ -112,4 +153,35 @@ func appendLocal(path string, p Payload) error {
 	}
 	_, err = f.Write(append(b, '\n'))
 	return err
+}
+
+func curlInstallGuide() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Install curl: winget install cURL.cURL (or choco install curl)"
+	case "darwin":
+		return "Install curl: brew install curl"
+	default:
+		return "Install curl using your package manager (e.g. apt install curl / dnf install curl / pacman -S curl)"
+	}
+}
+
+func CurlPreflight(cfg config.Config) error {
+	if cfg.Runtime.DryRun || !cfg.Notify.Discord.Enabled {
+		return nil
+	}
+	if cfg.Notify.Discord.WebhookURL == "" {
+		return errors.New("discord webhook is empty")
+	}
+	if _, err := exec.LookPath(curlCommandName()); err != nil {
+		return fmt.Errorf("%w. %s", ErrCurlNotFound, curlInstallGuide())
+	}
+	return nil
+}
+
+func curlCommandName() string {
+	if runtime.GOOS == "windows" {
+		return "curl.exe"
+	}
+	return "curl"
 }

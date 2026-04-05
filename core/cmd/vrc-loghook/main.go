@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/hatolife/VRCLogHook/core/internal/app"
@@ -29,8 +33,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	reloadOnly := fs.Bool("reload", false, "reload config over IPC")
 	stopOnly := fs.Bool("stop", false, "stop daemon over IPC")
 	printConfig := fs.Bool("print-config", false, "print masked config and exit")
+	openGUI := fs.Bool("open-gui", false, "launch vrc-loghook-gui and exit")
+	guiBin := fs.String("gui-bin", "", "path to vrc-loghook-gui binary (optional)")
 	if err := fs.Parse(args); err != nil {
 		return fail(stderr, err)
+	}
+
+	if *openGUI {
+		if err := startGUI(*guiBin, *configPath, *ipcPath); err != nil {
+			return fail(stderr, err)
+		}
+		_, _ = fmt.Fprintln(stdout, "gui launched")
+		return 0
 	}
 
 	if *statusOnly || *reloadOnly || *stopOnly {
@@ -88,4 +102,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 func fail(stderr io.Writer, err error) int {
 	_, _ = fmt.Fprintln(stderr, "error:", err)
 	return 1
+}
+
+var startGUI = func(guiBin, configPath, ipcPath string) error {
+	bin := guiBin
+	if strings.TrimSpace(bin) == "" {
+		bin = defaultGUIBinaryName()
+	}
+	cmd := exec.Command(bin, "--config", configPath, "--ipc", ipcPath)
+	applyGUIProcessAttrs(cmd)
+	return cmd.Start()
+}
+
+func defaultGUIBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "vrc-loghook-gui.exe"
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		return filepath.Join(dir, "vrc-loghook-gui")
+	}
+	return "vrc-loghook-gui"
 }

@@ -8,6 +8,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,24 +29,28 @@ type Service struct {
 	configPath string
 	ipcPath    string
 
-	mu          sync.RWMutex
-	cfg         config.Config
-	rules       []matcher.CompiledRule
-	tailer      *monitor.Tailer
-	stateStore  *state.Store
-	dispatcher  *notify.Dispatcher
-	hooks       *hook.Runner
-	logger      *log.Logger
-	logLevel    int32
-	lastEventAt time.Time
-	seen        map[string]time.Time
-	initialized bool
+	mu             sync.RWMutex
+	cfg            config.Config
+	rules          []matcher.CompiledRule
+	tailer         *monitor.Tailer
+	stateStore     *state.Store
+	dispatcher     *notify.Dispatcher
+	hooks          *hook.Runner
+	logger         *log.Logger
+	logLevel       int32
+	lastEventAt    time.Time
+	seen           map[string]time.Time
+	initialized    bool
+	lastNoFileWarn time.Time
 }
 
 func New(configPath, ipcPath string) (*Service, error) {
 	cfg, err := config.LoadOrCreate(configPath)
 	if err != nil {
 		return nil, err
+	}
+	if fixedDir, ok := resolveMonitorLogDir(runtime.GOOS, cfg.Monitor.LogDir, pathExists); ok {
+		cfg.Monitor.LogDir = fixedDir
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Observability.SelfLogPath), 0o755); err != nil {
 		return nil, err
@@ -79,13 +86,22 @@ func New(configPath, ipcPath string) (*Service, error) {
 		hooks: hook.New(cfg.Hooks.MaxConcurrency, func(err error) {
 			logger.Printf("hook error: %v", err)
 		}),
-		logger:      logger,
-		seen:        map[string]time.Time{},
-		lastEventAt: time.Time{},
+		logger:         logger,
+		seen:           map[string]time.Time{},
+		lastEventAt:    time.Time{},
+		lastNoFileWarn: time.Time{},
 	}
 	s.setLogLevel(cfg.Observability.LogLevel)
 	s.logInfo("service init: config=%s state=%s log_dir=%s file_glob=%s dry_run=%v", s.configPath, cfg.State.Path, cfg.Monitor.LogDir, cfg.Monitor.FileGlob, cfg.Runtime.DryRun)
+	s.logStartupProbe(cfg)
+	s.logEffectiveNotificationAndRules(cfg)
+	if cfg.Monitor.LogDir == "" || !pathExists(cfg.Monitor.LogDir) {
+		s.logWarn("monitor directory does not exist: log_dir=%s", cfg.Monitor.LogDir)
+	}
 	s.logDebug("service init detail: %s", BuildSafeTokenLine(cfg))
+	if err := notify.CurlPreflight(cfg); err != nil {
+		s.logWarn("notification preflight: %v", err)
+	}
 	return s, nil
 }
 
@@ -107,20 +123,27 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 	defer server.Close()
 
-	saveTicker := time.NewTicker(time.Duration(s.cfg.State.SaveIntervalSec) * time.Second)
-	statusTicker := time.NewTicker(time.Duration(s.cfg.Observability.StatusLogSec) * time.Second)
-	reloadTicker := time.NewTicker(time.Duration(s.cfg.Runtime.ConfigReloadSec) * time.Second)
+	s.mu.RLock()
+	initialPollSec := s.cfg.Monitor.PollIntervalSec
+	saveSec := s.cfg.State.SaveIntervalSec
+	statusSec := s.cfg.Observability.StatusLogSec
+	reloadSec := s.cfg.Runtime.ConfigReloadSec
+	s.mu.RUnlock()
+
+	pollTicker := time.NewTicker(time.Duration(initialPollSec) * time.Second)
+	saveTicker := time.NewTicker(time.Duration(saveSec) * time.Second)
+	statusTicker := time.NewTicker(time.Duration(statusSec) * time.Second)
+	reloadTicker := time.NewTicker(time.Duration(reloadSec) * time.Second)
+	currentPollSec := initialPollSec
+	currentReloadSec := reloadSec
+	currentStatusSec := statusSec
+	currentSaveSec := saveSec
+	defer pollTicker.Stop()
 	defer saveTicker.Stop()
 	defer statusTicker.Stop()
 	defer reloadTicker.Stop()
 
 	for {
-		s.mu.RLock()
-		interval := s.cfg.Monitor.PollIntervalSec
-		hotReload := s.cfg.Runtime.HotReload
-		s.mu.RUnlock()
-
-		pollTimer := time.NewTimer(time.Duration(interval) * time.Second)
 		select {
 		case <-ctx.Done():
 			s.logInfo("shutdown requested")
@@ -128,7 +151,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.hooks.Wait()
 			s.logInfo("shutdown completed")
 			return nil
-		case <-pollTimer.C:
+		case <-pollTicker.C:
 			if err := s.pollOnce(ctx); err != nil {
 				s.logError("poll error: %v", err)
 			}
@@ -142,13 +165,44 @@ func (s *Service) Run(ctx context.Context) error {
 			b, _ := json.Marshal(s.status())
 			s.logInfo("status=%s", string(b))
 		case <-reloadTicker.C:
+			s.mu.RLock()
+			hotReload := s.cfg.Runtime.HotReload
+			s.mu.RUnlock()
 			if hotReload {
 				if err := s.reload(); err != nil {
 					s.logError("reload error: %v", err)
 				}
 			}
+
+			// Keep ticker intervals aligned with runtime config changes.
+			s.mu.RLock()
+			nextPollSec := s.cfg.Monitor.PollIntervalSec
+			nextReloadSec := s.cfg.Runtime.ConfigReloadSec
+			nextStatusSec := s.cfg.Observability.StatusLogSec
+			nextSaveSec := s.cfg.State.SaveIntervalSec
+			s.mu.RUnlock()
+
+			if nextPollSec != currentPollSec {
+				pollTicker.Reset(time.Duration(nextPollSec) * time.Second)
+				currentPollSec = nextPollSec
+				s.logInfo("poll interval updated: %ds", currentPollSec)
+			}
+			if nextReloadSec != currentReloadSec {
+				reloadTicker.Reset(time.Duration(nextReloadSec) * time.Second)
+				currentReloadSec = nextReloadSec
+				s.logInfo("reload interval updated: %ds", currentReloadSec)
+			}
+			if nextStatusSec != currentStatusSec {
+				statusTicker.Reset(time.Duration(nextStatusSec) * time.Second)
+				currentStatusSec = nextStatusSec
+				s.logInfo("status interval updated: %ds", currentStatusSec)
+			}
+			if nextSaveSec != currentSaveSec {
+				saveTicker.Reset(time.Duration(nextSaveSec) * time.Second)
+				currentSaveSec = nextSaveSec
+				s.logInfo("state save interval updated: %ds", currentSaveSec)
+			}
 		}
-		pollTimer.Stop()
 	}
 }
 
@@ -157,13 +211,26 @@ func (s *Service) pollOnce(ctx context.Context) error {
 	cfg := s.cfg
 	rules := s.rules
 	s.mu.RUnlock()
+	prevFile, prevOffset := s.tailer.Current()
 
 	if !s.initialized {
-		if _, err := s.tailer.Poll(true); err != nil {
+		evs, err := s.tailer.Poll(true)
+		if err != nil {
 			return err
 		}
 		curFile, curOffset := s.tailer.Current()
+		if curFile == "" && s.tryRecoverLogDir(cfg) {
+			evs, err = s.tailer.Poll(true)
+			if err != nil {
+				return err
+			}
+			curFile, curOffset = s.tailer.Current()
+		}
+		s.logDebug("poll trace: phase=startup prev_file=%s prev_offset=%d cur_file=%s cur_offset=%d events=%d", prevFile, prevOffset, curFile, curOffset, len(evs))
 		s.logInfo("startup monitor target: file=%s offset=%d", curFile, curOffset)
+		if curFile == "" {
+			s.warnNoLogFile(cfg)
+		}
 		if curFile != "" {
 			if saved, ok := s.stateStore.Get(curFile); ok {
 				s.logInfo("resume from saved offset: file=%s offset=%d", curFile, saved.Offset)
@@ -203,11 +270,19 @@ func (s *Service) pollOnce(ctx context.Context) error {
 		return err
 	}
 	curFile, curOffset := s.tailer.Current()
+	if curFile == "" && s.tryRecoverLogDir(cfg) {
+		events, err = s.tailer.Poll(true)
+		if err != nil {
+			return err
+		}
+		curFile, curOffset = s.tailer.Current()
+	}
+	s.logDebug("poll trace: phase=steady prev_file=%s prev_offset=%d cur_file=%s cur_offset=%d events=%d", prevFile, prevOffset, curFile, curOffset, len(events))
+	if curFile == "" {
+		s.warnNoLogFile(cfg)
+	}
 	if curFile != "" {
 		s.stateStore.Set(curFile, curOffset)
-	}
-	if len(events) > 0 {
-		s.logDebug("poll received events: count=%d file=%s", len(events), curFile)
 	}
 	return s.processEvents(ctx, cfg, rules, events)
 }
@@ -215,6 +290,16 @@ func (s *Service) pollOnce(ctx context.Context) error {
 func (s *Service) processEvents(ctx context.Context, cfg config.Config, rules []matcher.CompiledRule, events []monitor.Event) error {
 	for _, ev := range events {
 		matched := matcher.MatchLine(ev.Line, rules)
+		linePreview := previewLine(ev.Line, 180)
+		if len(matched) == 0 {
+			s.logDebug("line analyzed: matched=none file=%s line=%q", ev.File, linePreview)
+			continue
+		}
+		ruleNames := make([]string, 0, len(matched))
+		for _, rule := range matched {
+			ruleNames = append(ruleNames, rule.Name)
+		}
+		s.logInfo("line analyzed: matched=%s file=%s line=%q", strings.Join(ruleNames, ","), ev.File, linePreview)
 		for _, rule := range matched {
 			key := rule.Name + ":" + ev.Line
 			if s.isDuplicate(key, time.Duration(cfg.Match.DedupeWindowSec)*time.Second) {
@@ -222,7 +307,7 @@ func (s *Service) processEvents(ctx context.Context, cfg config.Config, rules []
 				continue
 			}
 			s.logInfo("event matched: rule=%s file=%s", rule.Name, ev.File)
-			if err := s.dispatcher.Send(ctx, cfg, rule.Name, ev); err != nil {
+			if err := s.dispatcher.SendWithRule(ctx, cfg, rule, ev); err != nil {
 				s.logError("notify error: rule=%s err=%v", rule.Name, err)
 			} else {
 				s.logDebug("notify success: rule=%s", rule.Name)
@@ -265,12 +350,23 @@ func (s *Service) reload() error {
 	if err != nil {
 		return err
 	}
+	s.mu.RLock()
+	prevSnapshot := s.cfg
+	s.mu.RUnlock()
+	if reflect.DeepEqual(prevSnapshot, cfg) {
+		s.logDebug("config reload checked: no changes")
+		return nil
+	}
 	rules, err := matcher.Compile(cfg.Match.Rules)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if reflect.DeepEqual(s.cfg, cfg) {
+		s.logDebug("config reload checked: no changes")
+		return nil
+	}
 	prev := s.cfg
 	s.cfg = cfg
 	s.setLogLevel(cfg.Observability.LogLevel)
@@ -283,6 +379,19 @@ func (s *Service) reload() error {
 	if prev.Observability.SelfLogPath != cfg.Observability.SelfLogPath || prev.Observability.Stdout != cfg.Observability.Stdout {
 		s.logWarn("observability output destination change requires restart: self_log_path/stdout")
 	}
+	if fixedDir, ok := resolveMonitorLogDir(runtime.GOOS, s.cfg.Monitor.LogDir, pathExists); ok {
+		s.cfg.Monitor.LogDir = fixedDir
+		s.tailer.LogDir = fixedDir
+		s.logWarn("monitor log_dir fallback applied: %s", fixedDir)
+	}
+	if s.cfg.Monitor.LogDir == "" || !pathExists(s.cfg.Monitor.LogDir) {
+		s.logWarn("monitor directory does not exist: log_dir=%s", s.cfg.Monitor.LogDir)
+	}
+	if err := notify.CurlPreflight(cfg); err != nil {
+		s.logWarn("notification preflight: %v", err)
+	}
+	s.logStartupProbe(s.cfg)
+	s.logEffectiveNotificationAndRules(s.cfg)
 	s.logInfo("config reloaded: log_dir=%s poll=%ds level=%s webhook=%s", cfg.Monitor.LogDir, cfg.Monitor.PollIntervalSec, cfg.Observability.LogLevel, config.MaskedWebhookURL(cfg.Notify.Discord.WebhookURL))
 	return nil
 }
@@ -328,6 +437,69 @@ func ParseFlagList(raw string) []string {
 	return out
 }
 
+func previewLine(line string, maxRune int) string {
+	if maxRune <= 0 {
+		return ""
+	}
+	runes := []rune(strings.TrimSpace(line))
+	if len(runes) <= maxRune {
+		return string(runes)
+	}
+	if maxRune <= 1 {
+		return string(runes[:1])
+	}
+	if maxRune <= 3 {
+		return string(runes[:maxRune])
+	}
+	return string(runes[:maxRune-3]) + "..."
+}
+
+func pathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func resolveMonitorLogDir(goos, dir string, exists func(string) bool) (string, bool) {
+	clean := strings.TrimSpace(dir)
+	if clean == "" {
+		return dir, false
+	}
+	if goos != "windows" {
+		return dir, false
+	}
+	if exists(clean) {
+		return clean, false
+	}
+	alt, ok := windowsLogDirFallback(clean)
+	if !ok {
+		return clean, false
+	}
+	if exists(alt) {
+		return alt, true
+	}
+	return clean, false
+}
+
+func windowsLogDirFallback(path string) (string, bool) {
+	p := strings.ReplaceAll(strings.TrimSpace(path), "/", `\`)
+	lp := strings.ToLower(p)
+	legacy := `\appdata\local\low\`
+	current := `\appdata\locallow\`
+	switch {
+	case strings.Contains(lp, legacy):
+		i := strings.Index(lp, legacy)
+		return p[:i] + `\AppData\LocalLow\` + p[i+len(legacy):], true
+	case strings.Contains(lp, current):
+		i := strings.Index(lp, current)
+		return p[:i] + `\AppData\Local\Low\` + p[i+len(current):], true
+	default:
+		return "", false
+	}
+}
+
 const (
 	levelDebug int32 = iota
 	levelInfo
@@ -362,4 +534,124 @@ func (s *Service) logf(level int32, label, format string, args ...any) {
 		return
 	}
 	s.logger.Printf("[%s] %s", label, fmt.Sprintf(format, args...))
+}
+
+func (s *Service) warnNoLogFile(cfg config.Config) {
+	now := time.Now()
+	if !s.lastNoFileWarn.IsZero() && now.Sub(s.lastNoFileWarn) < 60*time.Second {
+		return
+	}
+	s.lastNoFileWarn = now
+	s.logWarn("no log file found: log_dir=%s file_glob=%s", cfg.Monitor.LogDir, cfg.Monitor.FileGlob)
+}
+
+func (s *Service) tryRecoverLogDir(cfg config.Config) bool {
+	candidates := monitorDirCandidates(runtime.GOOS, cfg.Monitor.LogDir)
+	for _, dir := range candidates {
+		if strings.EqualFold(strings.TrimSpace(dir), strings.TrimSpace(s.tailer.LogDir)) {
+			continue
+		}
+		if !hasLogFileCandidate(dir, cfg.Monitor.FileGlob) {
+			continue
+		}
+		s.mu.Lock()
+		s.tailer.LogDir = dir
+		s.cfg.Monitor.LogDir = dir
+		s.mu.Unlock()
+		s.logWarn("monitor log_dir auto-recovered: %s", dir)
+		s.logStartupProbe(s.cfg)
+		return true
+	}
+	return false
+}
+
+func hasLogFileCandidate(dir, glob string) bool {
+	_, ok := latestByPattern(dir, glob)
+	return ok
+}
+
+func latestByPattern(dir, glob string) (string, bool) {
+	if strings.TrimSpace(dir) == "" || strings.TrimSpace(glob) == "" {
+		return "", false
+	}
+	pattern := filepath.Join(dir, glob)
+	files, err := filepath.Glob(pattern)
+	if err != nil || len(files) == 0 {
+		return "", false
+	}
+	sort.Slice(files, func(i, j int) bool {
+		ai, aErr := os.Stat(files[i])
+		bi, bErr := os.Stat(files[j])
+		if aErr != nil || bErr != nil {
+			return files[i] > files[j]
+		}
+		return ai.ModTime().After(bi.ModTime())
+	})
+	return files[0], true
+}
+
+func monitorDirCandidates(goos, dir string) []string {
+	out := make([]string, 0, 3)
+	seen := map[string]struct{}{}
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		k := strings.ToLower(v)
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		out = append(out, v)
+	}
+	add(dir)
+	if goos == "windows" {
+		if alt, ok := windowsLogDirFallback(dir); ok {
+			add(alt)
+		}
+		// Slash style variant helps when config was edited manually.
+		add(strings.ReplaceAll(dir, `\`, "/"))
+	}
+	return out
+}
+
+func (s *Service) logStartupProbe(cfg config.Config) {
+	candidates := monitorDirCandidates(runtime.GOOS, cfg.Monitor.LogDir)
+	s.logInfo("startup probe: candidates=%d file_glob=%s", len(candidates), cfg.Monitor.FileGlob)
+	for i, dir := range candidates {
+		latest, ok := latestByPattern(dir, cfg.Monitor.FileGlob)
+		if ok {
+			s.logInfo("startup probe[%d]: dir=%s exists=%v latest=%s", i, dir, pathExists(dir), latest)
+		} else {
+			s.logInfo("startup probe[%d]: dir=%s exists=%v latest=", i, dir, pathExists(dir))
+		}
+	}
+}
+
+func (s *Service) logEffectiveNotificationAndRules(cfg config.Config) {
+	names := make([]string, 0, len(cfg.Match.Rules))
+	for _, r := range cfg.Match.Rules {
+		if strings.TrimSpace(r.Name) != "" {
+			names = append(names, r.Name)
+		}
+	}
+	ruleList := strings.Join(names, ",")
+	if ruleList == "" {
+		ruleList = "(none)"
+	}
+	s.logInfo("effective rules: count=%d names=%s", len(cfg.Match.Rules), ruleList)
+	s.logInfo(
+		"effective notify: dry_run=%v discord_enabled=%v webhook=%s local_path=%s",
+		cfg.Runtime.DryRun,
+		cfg.Notify.Discord.Enabled,
+		config.MaskedWebhookURL(cfg.Notify.Discord.WebhookURL),
+		cfg.Notify.Local.Path,
+	)
+	if !cfg.Notify.Discord.Enabled {
+		s.logWarn("discord notification is disabled")
+	}
+	if cfg.Notify.Discord.Enabled && strings.TrimSpace(cfg.Notify.Discord.WebhookURL) == "" {
+		s.logWarn("discord webhook is empty while discord notification is enabled")
+	}
 }

@@ -87,3 +87,39 @@ func TestRunIPCStatusReloadStop(t *testing.T) {
 		t.Fatalf("stop failed: code=%d err=%s", code, errOut.String())
 	}
 }
+
+func TestRunOpenGUI(t *testing.T) {
+	called := false
+	old := startGUI
+	startGUI = func(guiBin, configPath, ipcPath string) error {
+		called = true
+		if guiBin != "/tmp/custom-gui" {
+			t.Fatalf("unexpected gui bin: %s", guiBin)
+		}
+		if configPath != "/tmp/config.json" {
+			t.Fatalf("unexpected config path: %s", configPath)
+		}
+		if ipcPath != "/tmp/test.sock" {
+			t.Fatalf("unexpected ipc path: %s", ipcPath)
+		}
+		return nil
+	}
+	defer func() { startGUI = old }()
+
+	var out, errOut bytes.Buffer
+	code := run([]string{
+		"--open-gui",
+		"--gui-bin", "/tmp/custom-gui",
+		"--config", "/tmp/config.json",
+		"--ipc", "/tmp/test.sock",
+	}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("expected success, got code=%d err=%s", code, errOut.String())
+	}
+	if !called {
+		t.Fatal("expected GUI launcher to be called")
+	}
+	if !strings.Contains(out.String(), "gui launched") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}

@@ -13,6 +13,7 @@
   - Config auto-generation and readable JSON output.
   - Local JSONL event log for matched events.
   - Log-level based self-observability output (`debug/info/warn/error`).
+  - Discord notification path uses explicit `curl` command invocation for transparency.
 - Reliability evidence:
   - Offset state store with corruption fallback.
   - Rotation-aware latest-file polling.
@@ -25,11 +26,12 @@
   - Unknown config key rejection.
   - Hook requires both `enabled` and `unsafe_consent`.
   - Hook timeout/max concurrency.
+  - Missing `curl` guidance is shown in preflight warnings.
 - Low runtime cost evidence:
   - Single polling loop and lightweight line matching.
   - Dedupe window map with periodic pruning.
 - Residual risk:
-  - GUI is currently a lightweight IPC client (no native desktop UI yet).
+  - GUI is local-web MVP (replaceable), not a full native desktop UI yet.
   - HJSON support is a conservative parser subset.
 - Corrective action:
   - Add richer GUI implementation and stricter HJSON parser in future revisions.
