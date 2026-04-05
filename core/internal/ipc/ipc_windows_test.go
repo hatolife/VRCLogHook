@@ -21,9 +21,20 @@ func TestServerClientMethodsWindows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = srv.Start(ctx) }()
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 
-	resp, err := Call(pipe, Request{Token: "tok", Method: "status"})
+	var (
+		resp Response
+		err  error
+	)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err = Call(pipe, Request{Token: "tok", Method: "status"})
+		if err == nil {
+			break
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
