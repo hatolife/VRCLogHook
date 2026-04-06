@@ -25,6 +25,24 @@ import (
 	"github.com/hatolife/VRCLogHook/core/internal/state"
 )
 
+var (
+	buildVersion  = "dev"
+	buildRevision = "unknown"
+	buildTime     = "unknown"
+)
+
+func SetBuildInfo(version, revision, builtAt string) {
+	if strings.TrimSpace(version) != "" {
+		buildVersion = strings.TrimSpace(version)
+	}
+	if strings.TrimSpace(revision) != "" {
+		buildRevision = strings.TrimSpace(revision)
+	}
+	if strings.TrimSpace(builtAt) != "" {
+		buildTime = strings.TrimSpace(builtAt)
+	}
+}
+
 type Service struct {
 	configPath string
 	ipcPath    string
@@ -47,6 +65,10 @@ type Service struct {
 func New(configPath, ipcPath string) (*Service, error) {
 	cfg, err := config.LoadOrCreate(configPath)
 	if err != nil {
+		return nil, err
+	}
+	cfg.Token = config.NewRuntimeToken()
+	if err := config.WriteRuntimeToken(configPath, cfg.Token); err != nil {
 		return nil, err
 	}
 	if fixedDir, ok := resolveMonitorLogDir(runtime.GOOS, cfg.Monitor.LogDir, pathExists); ok {
@@ -91,8 +113,13 @@ func New(configPath, ipcPath string) (*Service, error) {
 		lastEventAt:    time.Time{},
 		lastNoFileWarn: time.Time{},
 	}
+	s.dispatcher.SetAsyncErrorHandler(func(err error) {
+		s.logError("notify async error: %v", err)
+	})
 	s.setLogLevel(cfg.Observability.LogLevel)
+	s.logInfo("build: version=%s revision=%s built_at=%s", buildVersion, buildRevision, buildTime)
 	s.logInfo("service init: config=%s state=%s log_dir=%s file_glob=%s dry_run=%v", s.configPath, cfg.State.Path, cfg.Monitor.LogDir, cfg.Monitor.FileGlob, cfg.Runtime.DryRun)
+	s.logInfo("ipc runtime token refreshed: path=%s", config.RuntimeTokenPath(s.configPath))
 	s.logStartupProbe(cfg)
 	s.logEffectiveNotificationAndRules(cfg)
 	if cfg.Monitor.LogDir == "" || !pathExists(cfg.Monitor.LogDir) {
@@ -114,6 +141,18 @@ func (s *Service) Run(ctx context.Context) error {
 		GetConfig: s.safeConfig,
 		Reload:    s.reload,
 		Stop:      cancel,
+		GUILog: func(level, message string) {
+			switch strings.ToLower(strings.TrimSpace(level)) {
+			case "debug":
+				s.logDebug("gui: %s", message)
+			case "warn", "warning":
+				s.logWarn("gui: %s", message)
+			case "error":
+				s.logError("gui: %s", message)
+			default:
+				s.logInfo("gui: %s", message)
+			}
+		},
 	})
 	s.logInfo("ipc server start: path=%s", s.ipcPath)
 	go func() {
@@ -353,6 +392,8 @@ func (s *Service) reload() error {
 	s.mu.RLock()
 	prevSnapshot := s.cfg
 	s.mu.RUnlock()
+	// Keep runtime IPC token stable for the current process lifetime.
+	cfg.Token = prevSnapshot.Token
 	if reflect.DeepEqual(prevSnapshot, cfg) {
 		s.logDebug("config reload checked: no changes")
 		return nil

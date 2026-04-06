@@ -56,15 +56,14 @@ func TestSaveAndLoadConfig(t *testing.T) {
 func TestSaveConfigValidation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	cfg := guiConfig{Token: ""}
+	cfg := guiConfig{}
 	cfg.Monitor.PollIntervalSec = 15
 	cfg.Monitor.LogDir = "/tmp"
 	cfg.Monitor.FileGlob = "output_log_*.txt"
-	if err := saveConfig(path, cfg); err == nil {
-		t.Fatal("expected token validation error")
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatalf("unexpected validation error without token: %v", err)
 	}
 
-	cfg.Token = "tok"
 	cfg.Monitor.PollIntervalSec = 0
 	if err := saveConfig(path, cfg); err == nil {
 		t.Fatal("expected poll interval validation error")
@@ -85,5 +84,24 @@ func TestLoadConfigNotFound(t *testing.T) {
 	}
 	if !os.IsNotExist(err) {
 		t.Fatalf("expected os.IsNotExist error, got: %v", err)
+	}
+}
+
+func TestResolveIPCTokenPrefersRuntimeFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.hjson")
+	if err := os.WriteFile(runtimeTokenPath(cfgPath), []byte("tok-runtime\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveIPCToken(cfgPath, "tok-fallback")
+	if got != "tok-runtime" {
+		t.Fatalf("expected runtime token, got %q", got)
+	}
+	otherDir := filepath.Join(dir, "other")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got2 := resolveIPCToken(filepath.Join(otherDir, "missing.hjson"), "tok-fallback"); got2 != "tok-fallback" {
+		t.Fatalf("expected fallback token, got %q", got2)
 	}
 }

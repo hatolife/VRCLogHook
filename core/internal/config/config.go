@@ -51,6 +51,7 @@ type DiscordConfig struct {
 	WebhookURL     string `json:"webhook_url"`
 	Username       string `json:"username"`
 	MaxContentRune int    `json:"max_content_rune"`
+	MinIntervalSec int    `json:"min_interval_sec"`
 }
 
 type LocalConfig struct {
@@ -69,6 +70,7 @@ type MatchConfig struct {
 }
 
 type Rule struct {
+	Enabled         bool   `json:"enabled"`
 	Name            string `json:"name"`
 	Contains        string `json:"contains"`
 	Regex           string `json:"regex"`
@@ -148,6 +150,7 @@ func Defaults() Config {
 				WebhookURL:     "",
 				Username:       "VRC LogHook",
 				MaxContentRune: 1600,
+				MinIntervalSec: 5,
 			},
 			Local: LocalConfig{Path: filepath.Join(baseDir, "events.log")},
 			Retry: RetryConfig{MaxAttempts: 3, InitialBackoffMs: 500, MaxBackoffMs: 5000},
@@ -156,18 +159,21 @@ func Defaults() Config {
 			DedupeWindowSec: 30,
 			Rules: []Rule{
 				{
+					Enabled:         true,
 					Name:            "player-joined",
 					Regex:           `(?i)OnPlayer(Joined|EnteredRoom)\b`,
 					CaseSensitive:   false,
 					MessageTemplate: "[join] {line}",
 				},
 				{
+					Enabled:         true,
 					Name:            "player-left",
-					Regex:           `(?i)OnPlayerLeft(Room)?\b`,
+					Regex:           `(?i)OnPlayerLeft\s`,
 					CaseSensitive:   false,
 					MessageTemplate: "[left] {line}",
 				},
 				{
+					Enabled:         true,
 					Name:            "runtime-exception",
 					Contains:        "Exception",
 					CaseSensitive:   false,
@@ -198,12 +204,38 @@ func Defaults() Config {
 func LoadOrCreate(path string) (Config, error) {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		cfg := Defaults()
+		// Runtime IPC token is generated on each process start and is not persisted.
+		cfg.Token = ""
 		if err := Save(path, cfg); err != nil {
 			return Config{}, err
 		}
 		return cfg, nil
 	}
-	return Load(path)
+	cfg, err := Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if recErr := recoverInvalidConfig(path); recErr != nil {
+		return Config{}, fmt.Errorf("config load failed: %v (recovery failed: %w)", err, recErr)
+	}
+	cfg = Defaults()
+	cfg.Token = ""
+	if saveErr := Save(path, cfg); saveErr != nil {
+		return Config{}, fmt.Errorf("config load failed: %v (default regenerate failed: %w)", err, saveErr)
+	}
+	return cfg, nil
+}
+
+func recoverInvalidConfig(path string) error {
+	raw, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return readErr
+	}
+	backup := path + ".broken-" + time.Now().UTC().Format("20060102T150405Z")
+	if err := os.WriteFile(backup, raw, 0o600); err != nil {
+		return err
+	}
+	return nil
 }
 
 func Load(path string) (Config, error) {
@@ -228,6 +260,7 @@ func Load(path string) (Config, error) {
 	if cfg.Version == "" {
 		cfg.Version = "1"
 	}
+	applyRuleEnabledDefaultsFromRaw(clean, &cfg)
 	if runtime.GOOS == "windows" {
 		cfg.Monitor.LogDir = normalizeLegacyWindowsLogDir(cfg.Monitor.LogDir)
 	}
@@ -254,11 +287,37 @@ func upgradeLegacyMatchRules(cfg *Config) {
 		}
 		if r.Name == "player-left" && strings.EqualFold(strings.TrimSpace(r.Contains), "OnPlayerLeft") {
 			r.Contains = ""
-			r.Regex = `(?i)OnPlayerLeft(Room)?\b`
+			r.Regex = `(?i)OnPlayerLeft\s`
 			r.CaseSensitive = false
+		}
+		if r.Name == "player-left" && strings.TrimSpace(r.Regex) == `(?i)OnPlayerLeft(Room)?\b` {
+			r.Regex = `(?i)OnPlayerLeft\s`
 		}
 		if strings.TrimSpace(r.MessageTemplate) == "" {
 			r.MessageTemplate = defaultRuleTemplate(r.Name)
+		}
+	}
+}
+
+func applyRuleEnabledDefaultsFromRaw(clean []byte, cfg *Config) {
+	if len(cfg.Match.Rules) == 0 {
+		return
+	}
+	var raw struct {
+		Match struct {
+			Rules []map[string]any `json:"rules"`
+		} `json:"match"`
+	}
+	if err := json.Unmarshal(clean, &raw); err != nil {
+		return
+	}
+	for i := range cfg.Match.Rules {
+		if i >= len(raw.Match.Rules) {
+			cfg.Match.Rules[i].Enabled = true
+			continue
+		}
+		if _, ok := raw.Match.Rules[i]["enabled"]; !ok {
+			cfg.Match.Rules[i].Enabled = true
 		}
 	}
 }
@@ -283,12 +342,63 @@ func Save(path string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	out, err := json.MarshalIndent(cfg, "", "  ")
+	body, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
+	out := append([]byte(configCommentHeader), body...)
 	return os.WriteFile(path, out, 0o600)
 }
+
+const configCommentHeader = `// VRC LogHook configuration (UTF-8)
+// Priority policy: Transparency > Reliability > Security > Low runtime cost
+// token: Legacy compatibility field. Runtime IPC auth token is regenerated on each daemon start
+// and written to <config-dir>/ipc.token (owner-only).
+//
+// monitor.poll_interval_sec: Poll interval seconds for reading appended log lines. Range: 1..60
+// monitor.log_dir: VRChat log directory path.
+// monitor.file_glob: Log file glob pattern (default: output_log_*.txt).
+// monitor.check_existing_on_first_run: true means first startup scans existing lines once.
+//
+// state.path: Persistent state file path for offsets and resume.
+// state.save_interval_sec: State flush interval seconds.
+//
+// notify.discord.enabled: Enable Discord webhook notifications.
+// notify.discord.webhook_url: Discord webhook URL (treat as secret).
+// notify.discord.username: Username displayed in Discord.
+// notify.discord.max_content_rune: Max notification text length. Range: 100..1900
+// notify.discord.min_interval_sec: Minimum Discord send interval seconds. 0 disables batching.
+// notify.local.path: Local JSONL event log path (always written).
+// notify.retry.max_attempts: Retry count for webhook sending. Range: 1..10
+// notify.retry.initial_backoff_ms: Initial retry backoff milliseconds.
+// notify.retry.max_backoff_ms: Max retry backoff milliseconds.
+//
+// match.rules: Rule list. Each rule supports:
+//   - enabled: true enables the rule evaluation
+//   - name: Rule identifier
+//   - contains: Substring match (optional)
+//   - regex: Regex match (optional)
+//   - case_sensitive: true for case-sensitive contains
+//   - message_template: Notification template with placeholders
+//       {rule} {line} {file} {at}
+// match.dedupe_window_sec: Duplicate suppression window seconds. Range: 0..3600
+//
+// hooks.enabled: Enable external command hooks.
+// hooks.unsafe_consent: Explicit consent flag required for hooks.
+// hooks.max_concurrency: Max concurrent hook executions. Range: 1..16
+// hooks.timeout_sec: Hook execution timeout seconds. Range: 1..120
+// hooks.commands: Hook command definitions.
+//
+// runtime.dry_run: true disables external notifications/hooks (local logs still written).
+// runtime.hot_reload: Enable periodic config reload.
+// runtime.config_reload_sec: Hot reload interval seconds. Range: 1..300
+//
+// observability.self_log_path: Path to this tool's self log file.
+// observability.status_log_sec: Status log interval seconds. Range: 1..3600
+// observability.log_level: debug|info|warn|error
+// observability.stdout: Mirror self logs to stdout.
+
+`
 
 func Validate(cfg Config) error {
 	if cfg.Monitor.PollIntervalSec < 1 || cfg.Monitor.PollIntervalSec > 60 {
@@ -311,6 +421,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Notify.Discord.MaxContentRune < 100 || cfg.Notify.Discord.MaxContentRune > 1900 {
 		return errors.New("notify.discord.max_content_rune must be in [100,1900]")
+	}
+	if cfg.Notify.Discord.MinIntervalSec < 0 || cfg.Notify.Discord.MinIntervalSec > 300 {
+		return errors.New("notify.discord.min_interval_sec must be in [0,300]")
 	}
 	if cfg.Notify.Retry.MaxAttempts < 1 || cfg.Notify.Retry.MaxAttempts > 10 {
 		return errors.New("notify.retry.max_attempts must be in [1,10]")
@@ -392,6 +505,41 @@ func randomToken() string {
 		return fmt.Sprintf("tok-%d", time.Now().UnixNano())
 	}
 	return "tok-" + hex.EncodeToString(buf[:])
+}
+
+func NewRuntimeToken() string {
+	return randomToken()
+}
+
+func RuntimeTokenPath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), "ipc.token")
+}
+
+func WriteRuntimeToken(configPath, token string) error {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return errors.New("runtime token is empty")
+	}
+	path := RuntimeTokenPath(configPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(t+"\n"), 0o600)
+}
+
+func ReadRuntimeToken(configPath string) (string, error) {
+	b, err := os.ReadFile(RuntimeTokenPath(configPath))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func ResolveIPCToken(configPath, fallback string) string {
+	if tok, err := ReadRuntimeToken(configPath); err == nil && strings.TrimSpace(tok) != "" {
+		return strings.TrimSpace(tok)
+	}
+	return strings.TrimSpace(fallback)
 }
 
 func stripCommentsOutsideStrings(src string) string {

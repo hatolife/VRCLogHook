@@ -32,6 +32,20 @@ jobs:
       - name: test
         run: go test ./...
       - name: build core
-        run: go build ./core/cmd/vrc-loghook
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVISION="${GITHUB_SHA::7}"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -buildid= -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}"
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS}" ./core/cmd/vrc-loghook
       - name: build gui
-        run: go build ./gui/cmd/vrc-loghook-gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVISION="${GITHUB_SHA::7}"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -buildid= -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}"
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS}" ./gui/cmd/vrc-loghook-gui

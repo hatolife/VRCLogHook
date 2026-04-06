@@ -16,6 +16,9 @@ type CompiledRule struct {
 func Compile(rules []config.Rule) ([]CompiledRule, error) {
 	out := make([]CompiledRule, 0, len(rules))
 	for _, r := range rules {
+		if !r.Enabled {
+			continue
+		}
 		cr := CompiledRule{Rule: r}
 		if r.Regex != "" {
 			re, err := regexp.Compile(r.Regex)

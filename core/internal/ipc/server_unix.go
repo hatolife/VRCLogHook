@@ -18,6 +18,7 @@ type Handlers struct {
 	GetConfig func() any
 	Reload    func() error
 	Stop      func()
+	GUILog    func(level, message string)
 }
 
 type Server struct {
@@ -101,6 +102,21 @@ func (s *Server) dispatch(req Request) Response {
 		return Response{OK: true}
 	case "stop":
 		s.handlers.Stop()
+		return Response{OK: true}
+	case "gui.log":
+		level := "info"
+		message := ""
+		if m, ok := req.Body.(map[string]any); ok {
+			if v, ok := m["level"].(string); ok && v != "" {
+				level = v
+			}
+			if v, ok := m["message"].(string); ok {
+				message = v
+			}
+		}
+		if s.handlers.GUILog != nil && message != "" {
+			s.handlers.GUILog(level, message)
+		}
 		return Response{OK: true}
 	default:
 		return Response{OK: false, Error: "unknown method"}

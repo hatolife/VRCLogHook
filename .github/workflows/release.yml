@@ -20,9 +20,23 @@ jobs:
       - name: test
         run: go test ./...
       - name: build core
-        run: go build ./core/cmd/vrc-loghook
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVISION="${GITHUB_SHA::7}"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -buildid= -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}"
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS}" ./core/cmd/vrc-loghook
       - name: build gui
-        run: go build ./gui/cmd/vrc-loghook-gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVISION="${GITHUB_SHA::7}"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -buildid= -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}"
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS}" ./gui/cmd/vrc-loghook-gui
 
   build-artifacts:
     needs: verify
@@ -53,8 +67,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o dist/vrc-loghook-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./core/cmd/vrc-loghook
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o dist/vrc-loghook-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./gui/cmd/vrc-loghook-gui
+          REVISION="${GITHUB_SHA::7}"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS_COMMON="-s -w -buildid= -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}"
+          GUI_OUT="dist/vrc-loghook-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          CORE_OUT="dist/vrc-loghook-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS_COMMON}" -o "$GUI_OUT" ./gui/cmd/vrc-loghook-gui
+          GUI_HASH="$(sha256sum "$GUI_OUT" | awk '{print $1}')"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -buildvcs=false -tags netgo -ldflags="${LDFLAGS_COMMON} -X main.expectedGUIHash=${GUI_HASH}" -o "$CORE_OUT" ./core/cmd/vrc-loghook
       - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:

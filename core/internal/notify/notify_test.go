@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +67,7 @@ func TestSendDiscordRetryAndTrim(t *testing.T) {
 	cfg.Notify.Discord.Enabled = true
 	cfg.Notify.Discord.WebhookURL = "http://unit-test.local/webhook"
 	cfg.Notify.Discord.MaxContentRune = 20
+	cfg.Notify.Discord.MinIntervalSec = 0
 	cfg.Notify.Retry.MaxAttempts = 3
 	cfg.Notify.Retry.InitialBackoffMs = 1
 	cfg.Notify.Retry.MaxBackoffMs = 2
@@ -111,6 +113,7 @@ func TestSendDiscordFailsAfterMaxAttempts(t *testing.T) {
 	cfg.Notify.Local.Path = filepath.Join(t.TempDir(), "events.log")
 	cfg.Notify.Discord.Enabled = true
 	cfg.Notify.Discord.WebhookURL = "http://unit-test.local/webhook"
+	cfg.Notify.Discord.MinIntervalSec = 0
 	cfg.Notify.Retry.MaxAttempts = 2
 	cfg.Notify.Retry.InitialBackoffMs = 1
 	cfg.Notify.Retry.MaxBackoffMs = 1
@@ -153,5 +156,65 @@ func TestCurlCommandName(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && name != "curl" {
 		t.Fatalf("expected curl on non-windows, got %s", name)
+	}
+}
+
+func TestSendDiscordBatchesWithinMinInterval(t *testing.T) {
+	d := New()
+	d.lookPath = func(string) (string, error) { return "/usr/bin/curl", nil }
+
+	var mu sync.Mutex
+	hit := 0
+	lastContent := ""
+	done := make(chan struct{}, 1)
+	d.runCurl = func(_ context.Context, args []string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		hit++
+		i := indexOf(args, "-d")
+		if i < 0 || i+1 >= len(args) {
+			t.Fatal("curl args missing -d payload")
+		}
+		var body map[string]string
+		if err := json.Unmarshal([]byte(args[i+1]), &body); err != nil {
+			t.Fatal(err)
+		}
+		lastContent = body["content"]
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+		return "", nil
+	}
+
+	cfg := config.Defaults()
+	cfg.Notify.Local.Path = filepath.Join(t.TempDir(), "events.log")
+	cfg.Notify.Discord.Enabled = true
+	cfg.Notify.Discord.WebhookURL = "http://unit-test.local/webhook"
+	cfg.Notify.Discord.MinIntervalSec = 1
+	cfg.Notify.Discord.MaxContentRune = 200
+
+	ev1 := monitor.Event{File: "f", Line: "line-1", At: time.Now()}
+	ev2 := monitor.Event{File: "f", Line: "line-2", At: time.Now()}
+	if err := d.SendWithRule(context.Background(), cfg, config.Rule{Name: "r1", MessageTemplate: "{line}"}, ev1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SendWithRule(context.Background(), cfg, config.Rule{Name: "r2", MessageTemplate: "{line}"}, ev2); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("timed out waiting for batched send")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hit != 1 {
+		t.Fatalf("expected 1 batched webhook call, got %d", hit)
+	}
+	if !strings.Contains(lastContent, "line-1") || !strings.Contains(lastContent, "line-2") {
+		t.Fatalf("batched content missing lines: %q", lastContent)
 	}
 }

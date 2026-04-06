@@ -76,8 +76,8 @@ func TestDefaultsIncludeVRChatJoinLeavePatterns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("left rule regex should compile: %v", err)
 	}
-	if !leftCompiled.MatchString("2026.04.05 23:12:20 Debug      -  [Behaviour] OnPlayerLeftRoom") {
-		t.Fatal("left rule should match OnPlayerLeftRoom")
+	if leftCompiled.MatchString("2026.04.05 23:12:20 Debug      -  [Behaviour] OnPlayerLeftRoom") {
+		t.Fatal("left rule should not match OnPlayerLeftRoom")
 	}
 	if !leftCompiled.MatchString("2026.04.05 23:12:20 Debug      -  [Behaviour] OnPlayerLeft Alice (usr_xxx)") {
 		t.Fatal("left rule should match OnPlayerLeft")
@@ -181,6 +181,26 @@ func TestMaskedToken(t *testing.T) {
 	}
 }
 
+func TestSaveWritesCommentHeader(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.hjson")
+	cfg := Defaults()
+	cfg.Monitor.LogDir = "/tmp"
+	cfg.State.Path = filepath.Join(dir, "state.json")
+	cfg.Notify.Local.Path = filepath.Join(dir, "events.log")
+	cfg.Observability.SelfLogPath = filepath.Join(dir, "self.log")
+	if err := Save(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "VRC LogHook configuration") {
+		t.Fatal("expected config header comments")
+	}
+}
+
 func TestLoadUpgradesLegacyJoinLeaveRules(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.json")
@@ -218,6 +238,9 @@ func TestLoadUpgradesLegacyJoinLeaveRules(t *testing.T) {
 	if cfg.Match.Rules[1].Regex == "" || cfg.Match.Rules[1].Contains != "" {
 		t.Fatalf("left rule was not upgraded: %+v", cfg.Match.Rules[1])
 	}
+	if cfg.Match.Rules[1].Regex != `(?i)OnPlayerLeft\s` {
+		t.Fatalf("left rule regex should be upgraded to strict left line: %q", cfg.Match.Rules[1].Regex)
+	}
 	if cfg.Match.Rules[0].MessageTemplate == "" || cfg.Match.Rules[1].MessageTemplate == "" {
 		t.Fatal("legacy rules should receive default message_template")
 	}
@@ -235,5 +258,112 @@ func TestNormalizeLegacyWindowsLogDir(t *testing.T) {
 	got2 := normalizeLegacyWindowsLogDir(in2)
 	if got2 != want {
 		t.Fatalf("slash normalized path mismatch: got=%q want=%q", got2, want)
+	}
+}
+
+func TestRuntimeTokenReadWriteAndResolve(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.hjson")
+	if err := os.WriteFile(cfgPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := RuntimeTokenPath(cfgPath); got != filepath.Join(dir, "ipc.token") {
+		t.Fatalf("unexpected runtime token path: %s", got)
+	}
+	if err := WriteRuntimeToken(cfgPath, "tok-runtime-test"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadRuntimeToken(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "tok-runtime-test" {
+		t.Fatalf("unexpected runtime token: %q", got)
+	}
+	if resolved := ResolveIPCToken(cfgPath, "tok-fallback"); resolved != "tok-runtime-test" {
+		t.Fatalf("resolve should prefer runtime token, got=%q", resolved)
+	}
+	otherDir := filepath.Join(dir, "other")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if resolved := ResolveIPCToken(filepath.Join(otherDir, "missing-config.hjson"), "tok-fallback"); resolved != "tok-fallback" {
+		t.Fatalf("resolve should fallback when token file is missing, got=%q", resolved)
+	}
+}
+
+func TestLoadOrCreateRecoversInvalidConfig(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.hjson")
+	invalid := `{
+  "version": "1",
+  "token": "tok-test",
+  "match": {
+    "rules": [
+      {"name":"bad","contains":"","regex":"","case_sensitive":false}
+    ],
+    "dedupe_window_sec": 30
+  }
+}`
+	if err := os.WriteFile(p, []byte(invalid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadOrCreate(p)
+	if err != nil {
+		t.Fatalf("LoadOrCreate should recover invalid config: %v", err)
+	}
+	if len(cfg.Match.Rules) == 0 {
+		t.Fatal("expected default rules after recovery")
+	}
+	if strings.TrimSpace(cfg.Token) != "" {
+		t.Fatalf("runtime token should not be persisted in regenerated config: %q", cfg.Token)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatalf("regenerated config should be loadable: %v", err)
+	}
+
+	matches, err := filepath.Glob(p + ".broken-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one backup file, got %d", len(matches))
+	}
+	b, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"name":"bad"`) {
+		t.Fatal("backup should contain original invalid config")
+	}
+}
+
+func TestLoadDefaultsRuleEnabledWhenFieldMissing(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	raw := `{
+  "version":"1",
+  "token":"tok-test",
+  "monitor":{"poll_interval_sec":10,"log_dir":"/tmp","file_glob":"output_log_*.txt","check_existing_on_first_run":true},
+  "state":{"path":"/tmp/state.json","save_interval_sec":10},
+  "notify":{"discord":{"enabled":false,"webhook_url":"","username":"x","max_content_rune":1000},"local":{"path":"/tmp/events.log"},"retry":{"max_attempts":2,"initial_backoff_ms":100,"max_backoff_ms":500}},
+  "match":{"rules":[{"name":"r1","contains":"Joined","regex":"","case_sensitive":false}],"dedupe_window_sec":0},
+  "hooks":{"enabled":false,"unsafe_consent":false,"max_concurrency":1,"timeout_sec":5,"commands":[]},
+  "runtime":{"dry_run":true,"hot_reload":true,"config_reload_sec":2},
+  "observability":{"self_log_path":"/tmp/self.log","status_log_sec":10,"log_level":"info","stdout":true}
+}`
+	if err := os.WriteFile(p, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Match.Rules) == 0 {
+		t.Fatal("rules should not be empty")
+	}
+	if !cfg.Match.Rules[0].Enabled {
+		t.Fatal("missing enabled field should default to true")
 	}
 }
