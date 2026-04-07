@@ -218,3 +218,67 @@ func TestSendDiscordBatchesWithinMinInterval(t *testing.T) {
 		t.Fatalf("batched content missing lines: %q", lastContent)
 	}
 }
+
+func TestSendWithRuleUsesGroupWebhookOverride(t *testing.T) {
+	d := New()
+	d.lookPath = func(string) (string, error) { return "/usr/bin/curl", nil }
+	var usedURL string
+	d.runCurl = func(_ context.Context, args []string) (string, error) {
+		for _, a := range args {
+			if strings.HasPrefix(a, "http://") || strings.HasPrefix(a, "https://") {
+				usedURL = a
+				break
+			}
+		}
+		return "", nil
+	}
+	cfg := config.Defaults()
+	cfg.Notify.Local.Path = filepath.Join(t.TempDir(), "events.log")
+	cfg.Notify.Discord.Enabled = true
+	cfg.Notify.Discord.WebhookURL = "https://default.invalid/webhook"
+	cfg.Notify.Discord.GroupWebhooks = map[string]string{
+		"error": "https://error.invalid/webhook",
+	}
+	cfg.Notify.Discord.MinIntervalSec = 0
+	if err := d.SendWithRule(context.Background(), cfg, config.Rule{
+		Name:            "runtime-exception",
+		Group:           "error",
+		MessageTemplate: "{line}",
+	}, monitor.Event{File: "f", Line: "x", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if usedURL != "https://error.invalid/webhook" {
+		t.Fatalf("expected group webhook URL, got %q", usedURL)
+	}
+}
+
+func TestSendWithRuleFallsBackToDefaultWebhook(t *testing.T) {
+	d := New()
+	d.lookPath = func(string) (string, error) { return "/usr/bin/curl", nil }
+	var usedURL string
+	d.runCurl = func(_ context.Context, args []string) (string, error) {
+		for _, a := range args {
+			if strings.HasPrefix(a, "http://") || strings.HasPrefix(a, "https://") {
+				usedURL = a
+				break
+			}
+		}
+		return "", nil
+	}
+	cfg := config.Defaults()
+	cfg.Notify.Local.Path = filepath.Join(t.TempDir(), "events.log")
+	cfg.Notify.Discord.Enabled = true
+	cfg.Notify.Discord.WebhookURL = "https://default.invalid/webhook"
+	cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	cfg.Notify.Discord.MinIntervalSec = 0
+	if err := d.SendWithRule(context.Background(), cfg, config.Rule{
+		Name:            "player-joined",
+		Group:           "info",
+		MessageTemplate: "{line}",
+	}, monitor.Event{File: "f", Line: "x", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if usedURL != "https://default.invalid/webhook" {
+		t.Fatalf("expected default webhook URL, got %q", usedURL)
+	}
+}

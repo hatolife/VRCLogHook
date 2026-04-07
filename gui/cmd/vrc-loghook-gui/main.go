@@ -52,11 +52,13 @@ type guiConfig struct {
 	} `json:"state"`
 	Notify struct {
 		Discord struct {
-			Enabled        bool   `json:"enabled"`
-			WebhookURL     string `json:"webhook_url"`
-			Username       string `json:"username"`
-			MaxContentRune int    `json:"max_content_rune"`
-			MinIntervalSec int    `json:"min_interval_sec"`
+			Enabled        bool              `json:"enabled"`
+			WebhookURL     string            `json:"webhook_url"`
+			GroupWebhooks  map[string]string `json:"group_webhooks"`
+			Groups         []string          `json:"groups"`
+			Username       string            `json:"username"`
+			MaxContentRune int               `json:"max_content_rune"`
+			MinIntervalSec int               `json:"min_interval_sec"`
 		} `json:"discord"`
 		Local struct {
 			Path string `json:"path"`
@@ -94,6 +96,7 @@ type guiConfig struct {
 type guiRule struct {
 	Enabled         bool   `json:"enabled"`
 	Name            string `json:"name"`
+	Group           string `json:"group"`
 	Contains        string `json:"contains"`
 	Regex           string `json:"regex"`
 	CaseSensitive   bool   `json:"case_sensitive"`
@@ -108,19 +111,23 @@ type guiHookCommand struct {
 }
 
 type pageData struct {
-	Now          string
-	Status       map[string]any
-	StatusError  string
-	ConfigPath   string
-	IPCPath      string
-	Config       guiConfig
-	RulesJSON    string
-	HooksJSON    string
-	DefaultRules template.JS
-	CurrentRules template.JS
-	DefaultHooks template.JS
-	CurrentHooks template.JS
-	Message      string
+	Now               string
+	Status            map[string]any
+	StatusError       string
+	ConfigPath        string
+	IPCPath           string
+	Config            guiConfig
+	RulesJSON         string
+	GroupsJSON        string
+	GroupWebhooksJSON string
+	HooksJSON         string
+	DefaultRules      template.JS
+	CurrentRules      template.JS
+	CurrentGroups     template.JS
+	CurrentGroupHooks template.JS
+	DefaultHooks      template.JS
+	CurrentHooks      template.JS
+	Message           string
 }
 
 func main() {
@@ -197,6 +204,16 @@ func handleSave(r *http.Request, configPath, ipcPath string) string {
 	cfg.Notify.Discord.Enabled = r.FormValue("notify.discord.enabled") == "on"
 	cfg.Notify.Discord.WebhookURL = strings.TrimSpace(r.FormValue("notify.discord.webhook_url"))
 	cfg.Notify.Discord.Username = strings.TrimSpace(r.FormValue("notify.discord.username"))
+	if parsed, err := parseStringArrayJSON(r.FormValue("notify.discord.groups_json")); err != nil {
+		return "save failed: invalid notify.discord.groups_json: " + err.Error()
+	} else {
+		cfg.Notify.Discord.Groups = parsed
+	}
+	if parsed, err := parseStringMapJSON(r.FormValue("notify.discord.group_webhooks_json")); err != nil {
+		return "save failed: invalid notify.discord.group_webhooks_json: " + err.Error()
+	} else {
+		cfg.Notify.Discord.GroupWebhooks = parsed
+	}
 	cfg.Notify.Discord.MaxContentRune = mustInt(r.FormValue("notify.discord.max_content_rune"), cfg.Notify.Discord.MaxContentRune)
 	cfg.Notify.Discord.MinIntervalSec = mustInt(r.FormValue("notify.discord.min_interval_sec"), cfg.Notify.Discord.MinIntervalSec)
 	cfg.Notify.Local.Path = strings.TrimSpace(r.FormValue("notify.local.path"))
@@ -234,6 +251,7 @@ func handleSave(r *http.Request, configPath, ipcPath string) string {
 	} else {
 		cfg.Hooks.Commands = parsed
 	}
+	normalizeGroupsAndRuleGroups(&cfg)
 
 	if err := saveConfig(configPath, cfg); err != nil {
 		return "save failed: " + err.Error()
@@ -271,9 +289,15 @@ func handleAction(r *http.Request, configPath, ipcPath string) string {
 		}
 		return "reset to defaults and reloaded"
 	case "add-rule":
+		normalizeGroupsAndRuleGroups(&cfg)
+		group := "info"
+		if len(cfg.Notify.Discord.Groups) > 0 {
+			group = cfg.Notify.Discord.Groups[0]
+		}
 		cfg.Match.Rules = append(cfg.Match.Rules, guiRule{
 			Enabled:         true,
 			Name:            "new-rule",
+			Group:           group,
 			Contains:        "__edit_me__",
 			MessageTemplate: "[{rule}] {line}",
 		})
@@ -287,6 +311,7 @@ func handleAction(r *http.Request, configPath, ipcPath string) string {
 		return "rule added and reloaded"
 	case "reset-rules-defaults":
 		cfg.Match.Rules = defaultRules()
+		normalizeGroupsAndRuleGroups(&cfg)
 		if saveErr := saveConfig(configPath, cfg); saveErr != nil {
 			return "reset rules failed: " + saveErr.Error()
 		}
@@ -304,6 +329,7 @@ func handleAction(r *http.Request, configPath, ipcPath string) string {
 		if len(cfg.Match.Rules) == 0 {
 			cfg.Match.Rules = defaultRules()
 		}
+		normalizeGroupsAndRuleGroups(&cfg)
 		if saveErr := saveConfig(configPath, cfg); saveErr != nil {
 			return "delete rule failed: " + saveErr.Error()
 		}
@@ -329,6 +355,7 @@ func renderPage(w http.ResponseWriter, configPath, ipcPath, message string) {
 	if len(cfg.Match.Rules) == 0 {
 		cfg.Match.Rules = defaultRules()
 	}
+	normalizeGroupsAndRuleGroups(&cfg)
 	status := map[string]any{}
 	statusErr := ""
 	if cfgErr == nil {
@@ -345,19 +372,23 @@ func renderPage(w http.ResponseWriter, configPath, ipcPath, message string) {
 	}
 
 	data := pageData{
-		Now:          time.Now().Format(time.RFC3339),
-		Status:       status,
-		StatusError:  statusErr,
-		ConfigPath:   configPath,
-		IPCPath:      ipcPath,
-		Config:       cfg,
-		RulesJSON:    prettyJSON(cfg.Match.Rules),
-		HooksJSON:    prettyJSON(cfg.Hooks.Commands),
-		DefaultRules: template.JS(jsonOrEmpty(defaultRules())),
-		CurrentRules: template.JS(jsonOrEmpty(cfg.Match.Rules)),
-		DefaultHooks: template.JS(jsonOrEmpty(defaultHookCommands())),
-		CurrentHooks: template.JS(jsonOrEmpty(cfg.Hooks.Commands)),
-		Message:      message,
+		Now:               time.Now().Format(time.RFC3339),
+		Status:            status,
+		StatusError:       statusErr,
+		ConfigPath:        configPath,
+		IPCPath:           ipcPath,
+		Config:            cfg,
+		RulesJSON:         prettyJSON(cfg.Match.Rules),
+		GroupsJSON:        prettyJSON(cfg.Notify.Discord.Groups),
+		GroupWebhooksJSON: prettyJSON(cfg.Notify.Discord.GroupWebhooks),
+		HooksJSON:         prettyJSON(cfg.Hooks.Commands),
+		DefaultRules:      template.JS(jsonOrEmpty(defaultRules())),
+		CurrentRules:      template.JS(jsonOrEmpty(cfg.Match.Rules)),
+		CurrentGroups:     template.JS(jsonOrEmpty(cfg.Notify.Discord.Groups)),
+		CurrentGroupHooks: template.JS(jsonOrEmpty(cfg.Notify.Discord.GroupWebhooks)),
+		DefaultHooks:      template.JS(jsonOrEmpty(defaultHookCommands())),
+		CurrentHooks:      template.JS(jsonOrEmpty(cfg.Hooks.Commands)),
+		Message:           message,
 	}
 	logToCore(configPath, ipcPath, "info", fmt.Sprintf("renderPage: rules=%d hooks=%d status_error=%v", len(cfg.Match.Rules), len(cfg.Hooks.Commands), statusErr != ""))
 	tpl := template.Must(template.New("page").Parse(pageHTML))
@@ -429,6 +460,12 @@ func loadConfig(path string) (guiConfig, error) {
 	if cfg.Notify.Discord.MaxContentRune == 0 {
 		cfg.Notify.Discord.MaxContentRune = 1600
 	}
+	if cfg.Notify.Discord.GroupWebhooks == nil {
+		cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	}
+	if len(cfg.Notify.Discord.Groups) == 0 {
+		cfg.Notify.Discord.Groups = []string{"info", "error"}
+	}
 	if cfg.Notify.Retry.MaxAttempts == 0 {
 		cfg.Notify.Retry.MaxAttempts = 3
 	}
@@ -455,6 +492,12 @@ func loadConfig(path string) (guiConfig, error) {
 	}
 	if len(cfg.Match.Rules) == 0 {
 		cfg.Match.Rules = defaultRules()
+	}
+	normalizeGroupsAndRuleGroups(&cfg)
+	for i := range cfg.Match.Rules {
+		if strings.TrimSpace(cfg.Match.Rules[i].Group) == "" {
+			cfg.Match.Rules[i].Group = defaultRuleGroupGUI(cfg.Match.Rules[i].Name)
+		}
 	}
 	return cfg, nil
 }
@@ -512,6 +555,8 @@ func defaultGUIConfig(path string) guiConfig {
 	cfg.State.SaveIntervalSec = 10
 	cfg.Notify.Discord.Enabled = false
 	cfg.Notify.Discord.WebhookURL = ""
+	cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	cfg.Notify.Discord.Groups = []string{"info", "error"}
 	cfg.Notify.Discord.Username = "VRC LogHook"
 	cfg.Notify.Discord.MaxContentRune = 1600
 	cfg.Notify.Discord.MinIntervalSec = 5
@@ -565,6 +610,7 @@ func saveConfig(path string, cfg guiConfig) error {
 	if cfg.Match.DedupeWindowSec == 0 {
 		cfg.Match.DedupeWindowSec = 30
 	}
+	normalizeGroupsAndRuleGroups(&cfg)
 	if len(cfg.Match.Rules) == 0 {
 		cfg.Match.Rules = defaultRules()
 	}
@@ -609,6 +655,29 @@ func saveConfig(path string, cfg guiConfig) error {
 	}
 	if len(cfg.Match.Rules) == 0 {
 		return errors.New("match.rules must not be empty")
+	}
+	if len(cfg.Notify.Discord.Groups) == 0 {
+		return errors.New("notify.discord.groups must not be empty")
+	}
+	seenGroups := map[string]struct{}{}
+	for i, g := range cfg.Notify.Discord.Groups {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			return fmt.Errorf("notify.discord.groups[%d] is empty", i)
+		}
+		if _, ok := seenGroups[g]; ok {
+			return fmt.Errorf("notify.discord.groups[%d] duplicates %q", i, g)
+		}
+		seenGroups[g] = struct{}{}
+	}
+	for i, rule := range cfg.Match.Rules {
+		group := strings.TrimSpace(rule.Group)
+		if group == "" {
+			return fmt.Errorf("match.rules[%d].group is empty", i)
+		}
+		if _, ok := seenGroups[group]; !ok {
+			return fmt.Errorf("match.rules[%d].group %q is not defined", i, rule.Group)
+		}
 	}
 	if cfg.Hooks.MaxConcurrency < 1 || cfg.Hooks.MaxConcurrency > 16 {
 		return errors.New("hooks.max_concurrency must be 1..16")
@@ -797,10 +866,16 @@ func parseRulesJSON(raw string) ([]guiRule, error) {
 	for i := range out {
 		if i >= len(rawArr) {
 			out[i].Enabled = true
+			if strings.TrimSpace(out[i].Group) == "" {
+				out[i].Group = defaultRuleGroupGUI(out[i].Name)
+			}
 			continue
 		}
 		if _, ok := rawArr[i]["enabled"]; !ok {
 			out[i].Enabled = true
+		}
+		if _, ok := rawArr[i]["group"]; !ok || strings.TrimSpace(out[i].Group) == "" {
+			out[i].Group = defaultRuleGroupGUI(out[i].Name)
 		}
 	}
 	return out, nil
@@ -814,6 +889,36 @@ func parseHookCommandsJSON(raw string) ([]guiHookCommand, error) {
 	var out []guiHookCommand
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+func parseStringMapJSON(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]string{}, nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = map[string]string{}
+	}
+	return out, nil
+}
+
+func parseStringArrayJSON(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{}, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []string{}
 	}
 	return out, nil
 }
@@ -833,6 +938,7 @@ func parseRulesFromForm(form url.Values) ([]guiRule, bool) {
 		r := guiRule{
 			Enabled:         form.Get(prefix+"enabled") == "on",
 			Name:            strings.TrimSpace(form.Get(prefix + "name")),
+			Group:           strings.TrimSpace(form.Get(prefix + "group")),
 			Contains:        strings.TrimSpace(form.Get(prefix + "contains")),
 			Regex:           strings.TrimSpace(form.Get(prefix + "regex")),
 			CaseSensitive:   form.Get(prefix+"case_sensitive") == "on",
@@ -840,6 +946,9 @@ func parseRulesFromForm(form url.Values) ([]guiRule, bool) {
 		}
 		if r.Name == "" && r.Contains == "" && r.Regex == "" && r.MessageTemplate == "" {
 			continue
+		}
+		if r.Group == "" {
+			r.Group = defaultRuleGroupGUI(r.Name)
 		}
 		out = append(out, r)
 	}
@@ -874,6 +983,7 @@ func defaultRules() []guiRule {
 		{
 			Enabled:         true,
 			Name:            "player-joined",
+			Group:           "info",
 			Contains:        "",
 			Regex:           `(?i)OnPlayer(Joined|EnteredRoom)\b`,
 			CaseSensitive:   false,
@@ -882,6 +992,7 @@ func defaultRules() []guiRule {
 		{
 			Enabled:         true,
 			Name:            "player-left",
+			Group:           "info",
 			Contains:        "",
 			Regex:           `(?i)OnPlayerLeft\s`,
 			CaseSensitive:   false,
@@ -890,6 +1001,7 @@ func defaultRules() []guiRule {
 		{
 			Enabled:         true,
 			Name:            "runtime-exception",
+			Group:           "error",
 			Contains:        "Exception",
 			Regex:           "",
 			CaseSensitive:   false,
@@ -900,6 +1012,57 @@ func defaultRules() []guiRule {
 
 func defaultHookCommands() []guiHookCommand {
 	return []guiHookCommand{}
+}
+
+func defaultRuleGroupGUI(name string) string {
+	switch name {
+	case "runtime-exception":
+		return "error"
+	case "player-joined", "player-left":
+		return "info"
+	default:
+		return "info"
+	}
+}
+
+func normalizeGroupsAndRuleGroups(cfg *guiConfig) {
+	if cfg.Notify.Discord.GroupWebhooks == nil {
+		cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	}
+	groups := make([]string, 0, len(cfg.Notify.Discord.Groups)+len(cfg.Match.Rules)+2)
+	addGroup := func(g string) {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			return
+		}
+		for _, ex := range groups {
+			if ex == g {
+				return
+			}
+		}
+		groups = append(groups, g)
+	}
+	for _, g := range cfg.Notify.Discord.Groups {
+		addGroup(g)
+	}
+	if len(groups) == 0 {
+		addGroup("info")
+		addGroup("error")
+	}
+	for i := range cfg.Match.Rules {
+		if strings.TrimSpace(cfg.Match.Rules[i].Group) == "" {
+			cfg.Match.Rules[i].Group = defaultRuleGroupGUI(cfg.Match.Rules[i].Name)
+		}
+		addGroup(cfg.Match.Rules[i].Group)
+	}
+	cfg.Notify.Discord.Groups = groups
+	filteredHooks := map[string]string{}
+	for _, g := range cfg.Notify.Discord.Groups {
+		if u := strings.TrimSpace(cfg.Notify.Discord.GroupWebhooks[g]); u != "" {
+			filteredHooks[g] = u
+		}
+	}
+	cfg.Notify.Discord.GroupWebhooks = filteredHooks
 }
 
 var pageHTML = `
@@ -918,7 +1081,7 @@ var pageHTML = `
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
     .muted { color:var(--muted); font-size:13px; }
     label { display:block; margin:8px 0 4px; font-size:13px; }
-    input[type=text], input[type=number], select { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--line); border-radius:8px; }
+    input[type=text], input[type=number], select, textarea { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--line); border-radius:8px; }
     .inline { display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
     button { border:none; border-radius:8px; padding:8px 12px; background:var(--accent); color:white; cursor:pointer; }
     button.secondary { background:#55617e; }
@@ -1001,11 +1164,41 @@ var pageHTML = `
       <div class="muted">VRChatログのディレクトリパス。</div>
       <label>notify.discord.webhook_url</label>
       <input type="text" name="notify.discord.webhook_url" value="{{.Config.Notify.Discord.WebhookURL}}">
-      <div class="muted">Discord Webhook URL。機密扱いで管理してください。</div>
+      <div class="muted">デフォルトのDiscord Webhook URL。グループ専用Webhook未設定時に使用します。</div>
+      </div>
+
+      <div id="tab-high" class="tab-panel">
+      <h3>高優先</h3>
+      <label>notify.discord.username</label>
+      <input type="text" name="notify.discord.username" value="{{.Config.Notify.Discord.Username}}">
+      <div class="muted">Discordに表示する送信者名。</div>
+      <label>notify.discord.groups（GUI編集）</label>
+      <div id="group-list">
+        {{range $i, $g := .Config.Notify.Discord.Groups}}
+          <div style="border:1px solid #d7dbea;border-radius:8px;padding:10px;margin-bottom:8px;">
+            <div class="inline" style="justify-content:space-between;">
+              <strong>Group {{$i}}</strong>
+              <button type="button" class="secondary" onclick="removeGroup({{$i}})">削除</button>
+            </div>
+            <label>group name</label>
+            <input type="text" value="{{$g}}" oninput="setGroupName({{$i}}, this.value)">
+            <div class="muted">ルールが参照するグループ名です（空白不可）。</div>
+            <label>webhook_url (optional)</label>
+            <input type="text" value="{{index $.Config.Notify.Discord.GroupWebhooks $g}}" oninput="setGroupWebhook({{$i}}, this.value)">
+            <div class="muted">このグループ専用Webhook。空欄なら notify.discord.webhook_url を使用します。</div>
+          </div>
+        {{end}}
+      </div>
+      <input type="hidden" id="discord-groups-json" name="notify.discord.groups_json" value="{{.GroupsJSON}}">
+      <input type="hidden" id="discord-group-webhooks-json" name="notify.discord.group_webhooks_json" value="{{.GroupWebhooksJSON}}">
+      <div class="inline" style="margin-top:8px;">
+        <button type="button" onclick="addGroup()">グループ追加</button>
+      </div>
+      <div class="muted">各グループにWebhook URLを設定できます。空欄の場合は <code>notify.discord.webhook_url</code> を使用します。</div>
 
       <details open id="match-rules-section">
-        <summary>最優先: match.rules（GUI編集）</summary>
-        <p class="muted">初期値ルール（join/left/error）もここに表示されます。contains または regex のどちらかは必須です。</p>
+        <summary>高優先: match.rules（GUI編集）</summary>
+        <p class="muted">ルールはここで管理します。contains または regex のどちらかは必須です。</p>
         <div id="rule-list">
           {{if .Config.Match.Rules}}
             {{range $i, $r := .Config.Match.Rules}}
@@ -1014,13 +1207,20 @@ var pageHTML = `
                   <summary>
                     <span class="rule-summary-line">
                       <input type="checkbox" name="rule_{{$i}}_enabled" {{if $r.Enabled}}checked{{end}} onclick="event.stopPropagation()">
-                      <span class="rule-summary-text"><strong>{{$r.Name}}</strong> / contains=<code>{{$r.Contains}}</code> / regex=<code>{{$r.Regex}}</code></span>
+                      <span class="rule-summary-text"><strong>{{$r.Name}}</strong> / group=<code>{{$r.Group}}</code> / contains=<code>{{$r.Contains}}</code> / regex=<code>{{$r.Regex}}</code></span>
                     </span>
                   </summary>
                   <div class="muted">enabled: true のときこのルールを評価します。false なら無効化されます。</div>
                   <label>name</label>
                   <input type="text" name="rule_{{$i}}_name" value="{{$r.Name}}">
                   <div class="muted">ルール名。通知やログで識別するための名前です。</div>
+                  <label>group</label>
+                  <select name="rule_{{$i}}_group" class="rule-group-select">
+                    {{range $g := $.Config.Notify.Discord.Groups}}
+                      <option value="{{$g}}" {{if eq $r.Group $g}}selected{{end}}>{{$g}}</option>
+                    {{end}}
+                  </select>
+                  <div class="muted">ルールの通知グループ。上で定義したグループから選択します。</div>
                   <label>contains</label>
                   <input type="text" name="rule_{{$i}}_contains" value="{{$r.Contains}}">
                   <div class="muted">この文字列を含む行を一致対象にします（部分一致）。</div>
@@ -1047,13 +1247,7 @@ var pageHTML = `
           <button type="submit" class="secondary" formaction="/action#match-rules-section" formmethod="post" name="action" value="reset-rules-defaults" onclick="saveScrollY(); return confirm('ルールを初期値に戻します。よろしいですか？');">初期値に戻す</button>
         </div>
       </details>
-      </div>
 
-      <div id="tab-high" class="tab-panel">
-      <h3>高優先</h3>
-      <label>notify.discord.username</label>
-      <input type="text" name="notify.discord.username" value="{{.Config.Notify.Discord.Username}}">
-      <div class="muted">Discordに表示する送信者名。</div>
       <label>notify.discord.max_content_rune</label>
       <input type="number" min="100" max="1900" name="notify.discord.max_content_rune" value="{{.Config.Notify.Discord.MaxContentRune}}">
       <div class="muted">通知本文の最大文字数。超過分は切り詰め。</div>
@@ -1174,6 +1368,13 @@ if (!Array.isArray(currentRules)) { currentRules = []; }
 if (currentRules.length === 0 && defaultRules.length > 0) {
   currentRules = JSON.parse(JSON.stringify(defaultRules));
 }
+var currentGroups = {{.CurrentGroups}};
+if (!Array.isArray(currentGroups)) { currentGroups = []; }
+if (currentGroups.length === 0) { currentGroups = ["info", "error"]; }
+var currentGroupHooks = {{.CurrentGroupHooks}};
+if (!currentGroupHooks || typeof currentGroupHooks !== "object" || Array.isArray(currentGroupHooks)) {
+  currentGroupHooks = {};
+}
 var defaultHooks = {{.DefaultHooks}};
 if (!Array.isArray(defaultHooks)) { defaultHooks = []; }
 var currentHooks = {{.CurrentHooks}};
@@ -1274,6 +1475,152 @@ function setupPriorityTabs() {
   sendGuiLog("info", "tab init: " + initial);
 }
 
+function groupOptionsHTML(selected) {
+  let html = "";
+  const groups = Array.isArray(currentGroups) ? currentGroups : [];
+  groups.forEach(function (g) {
+    const sel = String(g) === String(selected) ? " selected" : "";
+    html += '<option value="' + esc(g) + '"' + sel + '>' + esc(g) + '</option>';
+  });
+  return html;
+}
+
+function refreshRuleGroupSelectOptions() {
+  const selects = document.querySelectorAll("select.rule-group-select");
+  selects.forEach(function (sel) {
+    const prev = sel.value;
+    sel.innerHTML = groupOptionsHTML(prev);
+    if (!sel.value && currentGroups.length > 0) {
+      sel.value = currentGroups[0];
+    }
+  });
+}
+
+function renderGroups() {
+  const root = document.getElementById("group-list");
+  if (!root) { return; }
+  root.innerHTML = "";
+  if (!Array.isArray(currentGroups)) { currentGroups = []; }
+  if (currentGroups.length === 0) {
+    currentGroups = ["info"];
+  }
+  currentGroups.forEach(function (g, i) {
+    const row = document.createElement("div");
+    row.style.border = "1px solid #d7dbea";
+    row.style.borderRadius = "8px";
+    row.style.padding = "10px";
+    row.style.marginBottom = "8px";
+    row.innerHTML = [
+      '<div class="inline" style="justify-content:space-between;">',
+      '<strong>Group ' + (i + 1) + '</strong>',
+      '<button type="button" class="secondary" onclick="removeGroup(' + i + ')">削除</button>',
+      '</div>',
+      '<label>group name</label>',
+      '<input type="text" value="' + esc(g) + '" oninput="setGroupName(' + i + ', this.value)">',
+      '<div class="muted">ルールが参照するグループ名です（空白不可）。</div>',
+      '<label>webhook_url (optional)</label>',
+      '<input type="text" value="' + esc(currentGroupHooks[g] || "") + '" oninput="setGroupWebhook(' + i + ', this.value)">',
+      '<div class="muted">このグループ専用Webhook。空欄なら notify.discord.webhook_url を使用します。</div>'
+    ].join("");
+    root.appendChild(row);
+  });
+  refreshRuleGroupSelectOptions();
+}
+
+function setGroupName(i, raw) {
+  const next = String(raw || "").trim();
+  const prev = currentGroups[i] || "";
+  if (next === prev) {
+    return;
+  }
+  currentGroups[i] = next;
+  if (prev && Object.prototype.hasOwnProperty.call(currentGroupHooks, prev)) {
+    currentGroupHooks[next] = currentGroupHooks[prev];
+    delete currentGroupHooks[prev];
+  }
+  if (Array.isArray(currentRules)) {
+    currentRules.forEach(function (r) {
+      if ((r.group || "") === prev) {
+        r.group = next;
+      }
+    });
+  }
+  renderGroups();
+}
+
+function setGroupWebhook(i, raw) {
+  const group = (currentGroups[i] || "").trim();
+  if (!group) {
+    return;
+  }
+  const val = String(raw || "").trim();
+  if (val) {
+    currentGroupHooks[group] = val;
+  } else {
+    delete currentGroupHooks[group];
+  }
+}
+
+function addGroup() {
+  let base = "group";
+  let idx = 1;
+  while (currentGroups.indexOf(base + idx) >= 0) {
+    idx += 1;
+  }
+  currentGroups.push(base + idx);
+  renderGroups();
+}
+
+function removeGroup(i) {
+  if (currentGroups.length <= 1) {
+    alert("最低1つのグループが必要です。");
+    return;
+  }
+  const removed = currentGroups[i];
+  currentGroups.splice(i, 1);
+  delete currentGroupHooks[removed];
+  const fallback = currentGroups[0] || "info";
+  if (Array.isArray(currentRules)) {
+    currentRules.forEach(function (r) {
+      if ((r.group || "") === removed) {
+        r.group = fallback;
+      }
+    });
+  }
+  renderGroups();
+}
+
+function prepareGroupJSON() {
+  const cleaned = [];
+  const seen = {};
+  currentGroups.forEach(function (g) {
+    g = String(g || "").trim();
+    if (!g || seen[g]) { return; }
+    seen[g] = true;
+    cleaned.push(g);
+  });
+  if (cleaned.length === 0) {
+    cleaned.push("info");
+  }
+  currentGroups = cleaned;
+  const map = {};
+  cleaned.forEach(function (g) {
+    const v = String(currentGroupHooks[g] || "").trim();
+    if (v) {
+      map[g] = v;
+    }
+  });
+  currentGroupHooks = map;
+  const groupsEl = document.getElementById("discord-groups-json");
+  const hooksEl = document.getElementById("discord-group-webhooks-json");
+  if (groupsEl) {
+    groupsEl.value = JSON.stringify(currentGroups);
+  }
+  if (hooksEl) {
+    hooksEl.value = JSON.stringify(currentGroupHooks);
+  }
+}
+
 function renderRules() {
   const root = document.getElementById("rule-list");
   root.innerHTML = "";
@@ -1309,6 +1656,9 @@ function renderRules() {
       '<label>name</label>',
       '<input type="text" name="rule_' + i + '_name" value="' + esc(r.name) + '" oninput="setRule(' + i + ', \\'name\\', this.value)">',
       '<div class="muted">ルール名。通知やログで識別するための名前です。</div>',
+      '<label>group</label>',
+      '<select name="rule_' + i + '_group" class="rule-group-select" onchange="setRule(' + i + ', \\'group\\', this.value)">' + groupOptionsHTML(r.group || "info") + '</select>',
+      '<div class="muted">ルールの通知グループ。上で定義したグループから選択します。</div>',
       '<label>contains</label>',
       '<input type="text" name="rule_' + i + '_contains" value="' + esc(r.contains) + '" oninput="setRule(' + i + ', \\'contains\\', this.value)">',
       '<div class="muted">この文字列を含む行を一致対象にします（部分一致）。</div>',
@@ -1343,6 +1693,7 @@ function addRule() {
   currentRules.push({
     enabled: true,
     name: "new-rule",
+    group: "info",
     contains: "",
     regex: "",
     case_sensitive: false,
@@ -1438,6 +1789,7 @@ function resetHooksToDefault() {
 }
 
 function prepareHookJSON() {
+  prepareGroupJSON();
   document.getElementById("hooks-commands-json").value = JSON.stringify(currentHooks);
   return true;
 }
@@ -1448,6 +1800,7 @@ try {
   setupPriorityTabs();
   restoreScrollY();
   sendGuiLog("info", "gui init pre-render: defaultRulesType=" + (Array.isArray(defaultRules) ? "array" : typeof defaultRules) + " currentRulesType=" + (Array.isArray(currentRules) ? "array" : typeof currentRules));
+  renderGroups();
   renderHooks();
   sendGuiLog("info", "gui init done: defaultRules=" + defaultRules.length + " currentRules=" + currentRules.length + " currentHooks=" + currentHooks.length);
 } catch (e) {

@@ -47,11 +47,13 @@ type NotifyConfig struct {
 }
 
 type DiscordConfig struct {
-	Enabled        bool   `json:"enabled"`
-	WebhookURL     string `json:"webhook_url"`
-	Username       string `json:"username"`
-	MaxContentRune int    `json:"max_content_rune"`
-	MinIntervalSec int    `json:"min_interval_sec"`
+	Enabled        bool              `json:"enabled"`
+	WebhookURL     string            `json:"webhook_url"`
+	GroupWebhooks  map[string]string `json:"group_webhooks"`
+	Groups         []string          `json:"groups"`
+	Username       string            `json:"username"`
+	MaxContentRune int               `json:"max_content_rune"`
+	MinIntervalSec int               `json:"min_interval_sec"`
 }
 
 type LocalConfig struct {
@@ -72,6 +74,7 @@ type MatchConfig struct {
 type Rule struct {
 	Enabled         bool   `json:"enabled"`
 	Name            string `json:"name"`
+	Group           string `json:"group"`
 	Contains        string `json:"contains"`
 	Regex           string `json:"regex"`
 	CaseSensitive   bool   `json:"case_sensitive"`
@@ -148,6 +151,8 @@ func Defaults() Config {
 			Discord: DiscordConfig{
 				Enabled:        false,
 				WebhookURL:     "",
+				GroupWebhooks:  map[string]string{},
+				Groups:         []string{"info", "error"},
 				Username:       "VRC LogHook",
 				MaxContentRune: 1600,
 				MinIntervalSec: 5,
@@ -161,6 +166,7 @@ func Defaults() Config {
 				{
 					Enabled:         true,
 					Name:            "player-joined",
+					Group:           "info",
 					Regex:           `(?i)OnPlayer(Joined|EnteredRoom)\b`,
 					CaseSensitive:   false,
 					MessageTemplate: "[join] {line}",
@@ -168,6 +174,7 @@ func Defaults() Config {
 				{
 					Enabled:         true,
 					Name:            "player-left",
+					Group:           "info",
 					Regex:           `(?i)OnPlayerLeft\s`,
 					CaseSensitive:   false,
 					MessageTemplate: "[left] {line}",
@@ -175,6 +182,7 @@ func Defaults() Config {
 				{
 					Enabled:         true,
 					Name:            "runtime-exception",
+					Group:           "error",
 					Contains:        "Exception",
 					CaseSensitive:   false,
 					MessageTemplate: "[error] {line}",
@@ -265,6 +273,7 @@ func Load(path string) (Config, error) {
 		cfg.Monitor.LogDir = normalizeLegacyWindowsLogDir(cfg.Monitor.LogDir)
 	}
 	upgradeLegacyMatchRules(&cfg)
+	normalizeDiscordGroups(&cfg)
 	if strings.TrimSpace(cfg.Observability.LogLevel) == "" {
 		cfg.Observability.LogLevel = "info"
 	}
@@ -295,6 +304,9 @@ func upgradeLegacyMatchRules(cfg *Config) {
 		}
 		if strings.TrimSpace(r.MessageTemplate) == "" {
 			r.MessageTemplate = defaultRuleTemplate(r.Name)
+		}
+		if strings.TrimSpace(r.Group) == "" {
+			r.Group = defaultRuleGroup(r.Name)
 		}
 	}
 }
@@ -335,6 +347,52 @@ func defaultRuleTemplate(name string) string {
 	}
 }
 
+func defaultRuleGroup(name string) string {
+	switch name {
+	case "runtime-exception":
+		return "error"
+	case "player-joined", "player-left":
+		return "info"
+	default:
+		return "info"
+	}
+}
+
+func normalizeDiscordGroups(cfg *Config) {
+	if cfg.Notify.Discord.GroupWebhooks == nil {
+		cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	}
+	seen := map[string]struct{}{}
+	groups := make([]string, 0, len(cfg.Notify.Discord.Groups)+len(cfg.Match.Rules)+2)
+	for _, g := range cfg.Notify.Discord.Groups {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			continue
+		}
+		if _, ok := seen[g]; ok {
+			continue
+		}
+		seen[g] = struct{}{}
+		groups = append(groups, g)
+	}
+	for i := range cfg.Match.Rules {
+		g := strings.TrimSpace(cfg.Match.Rules[i].Group)
+		if g == "" {
+			g = defaultRuleGroup(cfg.Match.Rules[i].Name)
+			cfg.Match.Rules[i].Group = g
+		}
+		if _, ok := seen[g]; ok {
+			continue
+		}
+		seen[g] = struct{}{}
+		groups = append(groups, g)
+	}
+	if len(groups) == 0 {
+		groups = []string{"info", "error"}
+	}
+	cfg.Notify.Discord.Groups = groups
+}
+
 func Save(path string, cfg Config) error {
 	if err := Validate(cfg); err != nil {
 		return err
@@ -365,6 +423,8 @@ const configCommentHeader = `// VRC LogHook configuration (UTF-8)
 //
 // notify.discord.enabled: Enable Discord webhook notifications.
 // notify.discord.webhook_url: Discord webhook URL (treat as secret).
+// notify.discord.group_webhooks: Per-group webhook overrides. key=rule.group value=webhook URL.
+// notify.discord.groups: Defined group list used by match.rules[*].group.
 // notify.discord.username: Username displayed in Discord.
 // notify.discord.max_content_rune: Max notification text length. Range: 100..1900
 // notify.discord.min_interval_sec: Minimum Discord send interval seconds. 0 disables batching.
@@ -376,6 +436,7 @@ const configCommentHeader = `// VRC LogHook configuration (UTF-8)
 // match.rules: Rule list. Each rule supports:
 //   - enabled: true enables the rule evaluation
 //   - name: Rule identifier
+//   - group: Rule group key (e.g. info/error)
 //   - contains: Substring match (optional)
 //   - regex: Regex match (optional)
 //   - case_sensitive: true for case-sensitive contains
@@ -425,6 +486,23 @@ func Validate(cfg Config) error {
 	if cfg.Notify.Discord.MinIntervalSec < 0 || cfg.Notify.Discord.MinIntervalSec > 300 {
 		return errors.New("notify.discord.min_interval_sec must be in [0,300]")
 	}
+	if cfg.Notify.Discord.GroupWebhooks == nil {
+		cfg.Notify.Discord.GroupWebhooks = map[string]string{}
+	}
+	if len(cfg.Notify.Discord.Groups) == 0 {
+		return errors.New("notify.discord.groups must have at least one group")
+	}
+	seenGroups := map[string]struct{}{}
+	for i, g := range cfg.Notify.Discord.Groups {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			return fmt.Errorf("notify.discord.groups[%d] is empty", i)
+		}
+		if _, ok := seenGroups[g]; ok {
+			return fmt.Errorf("notify.discord.groups[%d] duplicates %q", i, g)
+		}
+		seenGroups[g] = struct{}{}
+	}
 	if cfg.Notify.Retry.MaxAttempts < 1 || cfg.Notify.Retry.MaxAttempts > 10 {
 		return errors.New("notify.retry.max_attempts must be in [1,10]")
 	}
@@ -437,6 +515,12 @@ func Validate(cfg Config) error {
 	for i, r := range cfg.Match.Rules {
 		if r.Name == "" {
 			return fmt.Errorf("match.rules[%d].name is required", i)
+		}
+		if strings.TrimSpace(r.Group) == "" {
+			return fmt.Errorf("match.rules[%d].group is required", i)
+		}
+		if _, ok := seenGroups[strings.TrimSpace(r.Group)]; !ok {
+			return fmt.Errorf("match.rules[%d].group %q is not defined in notify.discord.groups", i, r.Group)
 		}
 		if strings.TrimSpace(r.Contains) == "" && strings.TrimSpace(r.Regex) == "" {
 			return fmt.Errorf("match.rules[%d] needs contains or regex", i)

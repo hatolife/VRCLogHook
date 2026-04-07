@@ -74,6 +74,7 @@ func (d *Dispatcher) Send(ctx context.Context, cfg config.Config, ruleName strin
 }
 
 func (d *Dispatcher) SendWithRule(ctx context.Context, cfg config.Config, rule config.Rule, ev monitor.Event) error {
+	cfg = resolveDiscordWebhookByRuleGroup(cfg, rule)
 	ruleName := rule.Name
 	p := Payload{
 		Rule:   ruleName,
@@ -146,13 +147,27 @@ func CurlPreflight(cfg config.Config) error {
 	if cfg.Runtime.DryRun || !cfg.Notify.Discord.Enabled {
 		return nil
 	}
-	if cfg.Notify.Discord.WebhookURL == "" {
+	if cfg.Notify.Discord.WebhookURL == "" && len(cfg.Notify.Discord.GroupWebhooks) == 0 {
 		return errors.New("discord webhook is empty")
 	}
 	if _, err := exec.LookPath(curlCommandName()); err != nil {
 		return fmt.Errorf("%w. %s", ErrCurlNotFound, curlInstallGuide())
 	}
 	return nil
+}
+
+func resolveDiscordWebhookByRuleGroup(cfg config.Config, rule config.Rule) config.Config {
+	group := strings.TrimSpace(rule.Group)
+	if group == "" {
+		return cfg
+	}
+	if cfg.Notify.Discord.GroupWebhooks == nil {
+		return cfg
+	}
+	if u := strings.TrimSpace(cfg.Notify.Discord.GroupWebhooks[group]); u != "" {
+		cfg.Notify.Discord.WebhookURL = u
+	}
+	return cfg
 }
 
 func (d *Dispatcher) enqueueDiscord(cfg config.Config, msg string) error {

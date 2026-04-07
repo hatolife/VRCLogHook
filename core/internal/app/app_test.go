@@ -31,7 +31,7 @@ func TestServiceWritesLocalEventLog(t *testing.T) {
 	cfg.Monitor.PollIntervalSec = 1
 	cfg.Notify.Local.Path = filepath.Join(dir, "events.log")
 	cfg.Notify.Discord.Enabled = false
-	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Contains: "Joined room", CaseSensitive: false}}
+	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Group: "info", Contains: "Joined room", CaseSensitive: false}}
 	cfg.Runtime.DryRun = true
 	cfg.Observability.SelfLogPath = filepath.Join(dir, "self.log")
 	cfg.State.Path = filepath.Join(dir, "state.json")
@@ -100,7 +100,7 @@ func TestServiceStartupExistingLineCheck(t *testing.T) {
 			cfg.Monitor.CheckExistingOnFirstRun = tc.checkExisting
 			cfg.Notify.Local.Path = filepath.Join(dir, "events.log")
 			cfg.Notify.Discord.Enabled = false
-			cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Contains: "Joined room", CaseSensitive: false}}
+			cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Group: "info", Contains: "Joined room", CaseSensitive: false}}
 			cfg.Runtime.DryRun = true
 			cfg.Observability.SelfLogPath = filepath.Join(dir, "self.log")
 			cfg.State.Path = filepath.Join(dir, "state.json")
@@ -143,7 +143,7 @@ func TestServiceHotReloadRule(t *testing.T) {
 	cfg.Monitor.PollIntervalSec = 1
 	cfg.Notify.Local.Path = filepath.Join(dir, "events.log")
 	cfg.Notify.Discord.Enabled = false
-	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "r1", Contains: "alpha", CaseSensitive: false}}
+	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "r1", Group: "info", Contains: "alpha", CaseSensitive: false}}
 	cfg.Runtime.DryRun = true
 	cfg.Runtime.HotReload = true
 	cfg.Runtime.ConfigReloadSec = 1
@@ -160,7 +160,7 @@ func TestServiceHotReloadRule(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "r2", Contains: "beta", CaseSensitive: false}}
+	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "r2", Group: "info", Contains: "beta", CaseSensitive: false}}
 	if err := config.Save(cfgPath, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestServicePollNotStarvedByFrequentReload(t *testing.T) {
 	cfg.Monitor.PollIntervalSec = 3
 	cfg.Notify.Local.Path = filepath.Join(dir, "events.log")
 	cfg.Notify.Discord.Enabled = false
-	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Contains: "OnPlayerEnteredRoom", CaseSensitive: false}}
+	cfg.Match.Rules = []config.Rule{{Enabled: true, Name: "joined", Group: "info", Contains: "OnPlayerEnteredRoom", CaseSensitive: false}}
 	cfg.Runtime.DryRun = true
 	cfg.Runtime.HotReload = true
 	cfg.Runtime.ConfigReloadSec = 1
